@@ -1,0 +1,19 @@
+# Add to .gitignore
+echo "
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+.env
+
+# Logs
+logs/
+*.log
+
+# IDE
+.vscode/
+.idea/
+" >> .gitignore
