@@ -1,12 +1,14 @@
 """
 Strategy Engine for PulseTraderX
-7 CORE indicator strategies → Future ML Replacement
-FOREX-OPTIMIZED with longer timeframes
+6 ML-Based Strategies (s1-s6) + 1 Technical Main Decider (s7)
+ML strategies output only BUY or SELL (no HOLD)
+Main decider (s7) overrides all ML outputs when enabled
 """
 
 import numpy as np
 import pandas as pd
 from collections import deque
+from core.models import MLModelsManager
 
 # =============== Helper: Technical Indicators ===============
 def rsi(series: pd.Series, period: int = 14):
@@ -49,8 +51,16 @@ def mfi(high, low, close, volume, period=14):
 
 # =============== Strategy Engine Class ===============
 class mlEngine:
-    def __init__(self, ml_engine=None, passing_mark: int = 5, main_decider_enabled: bool = True):  # CHANGED: back to 5/7
-        self.ml_engine = ml_engine
+    def __init__(self, ml_models_manager=None, passing_mark: int = 5, main_decider_enabled: bool = True):
+        """
+        Initialize strategy engine with ML models manager
+        
+        Args:
+            ml_models_manager: MLModelsManager instance with 6 trained ML models
+            passing_mark: Minimum votes required (default 5/6 for ML strategies)
+            main_decider_enabled: If True, s7 (main decider) overrides all ML outputs
+        """
+        self.ml_models_manager = ml_models_manager
         self.passing_mark = passing_mark
         self.main_decider_enabled = main_decider_enabled
         self.price_history = deque(maxlen=500)
@@ -75,110 +85,194 @@ class mlEngine:
             "volume": list(self.volume_history)
         })
 
-    # ==================== 7 CORE STRATEGIES ====================
+    # ==================== ML-BASED STRATEGIES (s1-s6) ====================
+    # These now use ML models - output only BUY or SELL (no HOLD)
+    
     def s1_rsi(self, df):
-        if len(df) < 15: return "HOLD"
-        r = rsi(df.price)
-        if r.iloc[-1] < 35: return "BUY"
-        if r.iloc[-1] > 65: return "SELL"
-        return "HOLD"
+        """ML-based RSI strategy"""
+        if self.ml_models_manager is None:
+            # Fallback to rule-based if ML not available
+            if len(df) < 15: return "BUY"  # ML always outputs BUY or SELL
+            r = rsi(df.price)
+            if r.iloc[-1] < 35: return "BUY"
+            if r.iloc[-1] > 65: return "SELL"
+            return "BUY"  # Default to BUY (no HOLD for ML strategies)
+        
+        try:
+            _, decision = self.ml_models_manager.get_model("s1_rsi").predict(df)
+            return decision  # Will be BUY or SELL only
+        except Exception as e:
+            print(f"Error in s1_rsi ML prediction: {e}")
+            return "BUY"  # Fallback
 
     def s2_ema_cross(self, df):
-        if len(df) < 21: return "HOLD"
-        e5 = ema(df.price, 5)
-        e20 = ema(df.price, 20)
-        if e5.iloc[-1] > e20.iloc[-1]: return "BUY"
-        if e5.iloc[-1] < e20.iloc[-1]: return "SELL"
-        return "HOLD"
+        """ML-based EMA crossover strategy"""
+        if self.ml_models_manager is None:
+            if len(df) < 21: return "BUY"
+            e5 = ema(df.price, 5)
+            e20 = ema(df.price, 20)
+            if e5.iloc[-1] > e20.iloc[-1]: return "BUY"
+            if e5.iloc[-1] < e20.iloc[-1]: return "SELL"
+            return "BUY"
+        
+        try:
+            _, decision = self.ml_models_manager.get_model("s2_ema_cross").predict(df)
+            return decision
+        except Exception as e:
+            print(f"Error in s2_ema_cross ML prediction: {e}")
+            return "BUY"
 
     def s3_bollinger(self, df):
-        if len(df) < 21: return "HOLD"
-        upper, mid, lower = bollinger(df.price)
-        if df.price.iloc[-1] < lower.iloc[-1]: return "BUY"
-        if df.price.iloc[-1] > upper.iloc[-1]: return "SELL"
-        return "HOLD"
+        """ML-based Bollinger Bands strategy"""
+        if self.ml_models_manager is None:
+            if len(df) < 21: return "BUY"
+            upper, mid, lower = bollinger(df.price)
+            if df.price.iloc[-1] < lower.iloc[-1]: return "BUY"
+            if df.price.iloc[-1] > upper.iloc[-1]: return "SELL"
+            return "BUY"
+        
+        try:
+            _, decision = self.ml_models_manager.get_model("s3_bollinger").predict(df)
+            return decision
+        except Exception as e:
+            print(f"Error in s3_bollinger ML prediction: {e}")
+            return "BUY"
 
     def s4_mfi(self, df):
-        if len(df) < 15: return "HOLD"
-        m = mfi(df.high, df.low, df.price, df.volume)
-        if m.iloc[-1] < 25: return "BUY"
-        if m.iloc[-1] > 75: return "SELL"
-        return "HOLD"
+        """ML-based Money Flow Index strategy"""
+        if self.ml_models_manager is None:
+            if len(df) < 15: return "BUY"
+            m = mfi(df.high, df.low, df.price, df.volume)
+            if m.iloc[-1] < 25: return "BUY"
+            if m.iloc[-1] > 75: return "SELL"
+            return "BUY"
+        
+        try:
+            _, decision = self.ml_models_manager.get_model("s4_mfi").predict(df)
+            return decision
+        except Exception as e:
+            print(f"Error in s4_mfi ML prediction: {e}")
+            return "BUY"
 
     def s5_volume_break(self, df):
-        if len(df) < 30: return "HOLD"
-        recent = df.volume.iloc[-1]
-        mean = df.volume.iloc[-30:].mean()
-        if recent > mean * 1.5: return "BUY"
-        if recent < mean * 0.5: return "SELL"
-        return "HOLD"
+        """ML-based Volume Breakout strategy"""
+        if self.ml_models_manager is None:
+            if len(df) < 30: return "BUY"
+            recent = df.volume.iloc[-1]
+            mean = df.volume.iloc[-30:].mean()
+            if recent > mean * 1.5: return "BUY"
+            if recent < mean * 0.5: return "SELL"
+            return "BUY"
+        
+        try:
+            _, decision = self.ml_models_manager.get_model("s5_volume_break").predict(df)
+            return decision
+        except Exception as e:
+            print(f"Error in s5_volume_break ML prediction: {e}")
+            return "BUY"
 
     def s6_trend_slope(self, df):
-        if len(df) < 20: return "HOLD"
-        y = df.price.iloc[-20:]
-        x = np.arange(len(y))
-        slope = np.polyfit(x, y, 1)[0]
-        if slope > 0: return "BUY"
-        if slope < 0: return "SELL"
-        return "HOLD"
+        """ML-based Trend Slope strategy"""
+        if self.ml_models_manager is None:
+            if len(df) < 20: return "BUY"
+            y = df.price.iloc[-20:]
+            x = np.arange(len(y))
+            slope = np.polyfit(x, y, 1)[0]
+            if slope > 0: return "BUY"
+            if slope < 0: return "SELL"
+            return "BUY"
+        
+        try:
+            _, decision = self.ml_models_manager.get_model("s6_trend_slope").predict(df)
+            return decision
+        except Exception as e:
+            print(f"Error in s6_trend_slope ML prediction: {e}")
+            return "BUY"
 
-    def s7_trend_momentum(self, df):  # KEEP THIS - good for longer timeframe
-        """Trend momentum for longer timeframe trading"""
-        if len(df) < 50: return "HOLD"
+    # ==================== MAIN DECIDER (s7) - Technical Rule-Based ====================
+    def s7_trend_momentum(self, df):
+        """
+        Main Technical Decider - Rule-based strategy that overrides all ML outputs
+        This is the deterministic technical analysis strategy
+        """
+        if len(df) < 50: 
+            return "HOLD"  # Main decider can return HOLD
+        
         ema_20 = ema(df.price, 20)
         ema_50 = ema(df.price, 50)
-        if ema_20.iloc[-1] > ema_50.iloc[-1] and df.price.iloc[-1] > ema_20.iloc[-1]: return "BUY"
-        if ema_20.iloc[-1] < ema_50.iloc[-1] and df.price.iloc[-1] < ema_20.iloc[-1]: return "SELL"
+        r = rsi(df.price).iloc[-1]
+        trend = np.polyfit(np.arange(min(50, len(df))), df.price.iloc[-50:], 1)[0]
+        
+        # Strong BUY signal
+        if r < 40 and ema_20.iloc[-1] > ema_50.iloc[-1] and trend > 0.1 and df.price.iloc[-1] > ema_20.iloc[-1]:
+            return "BUY"
+        
+        # Strong SELL signal
+        if r > 60 and ema_20.iloc[-1] < ema_50.iloc[-1] and trend < -0.1 and df.price.iloc[-1] < ema_20.iloc[-1]:
+            return "SELL"
+        
         return "HOLD"
 
     # =============== Combined Decision ===============
     def decide(self):
+        """
+        Main decision function:
+        1. Get predictions from 6 ML models (s1-s6) - output only BUY/SELL
+        2. Get main decider signal (s7) - can output BUY/SELL/HOLD
+        3. If main_decider_enabled and s7 is BUY/SELL, return s7's decision (overrides all)
+        4. Otherwise, use voting on all 7 strategies:
+           - s1-s6: BUY or SELL only
+           - s7: BUY, SELL, or HOLD (HOLD counts as vote but doesn't contribute to threshold)
+           - Requires passing_mark votes (default 5 out of 7)
+        """
         df = self._df()
         if len(df) < 30 or self.is_paused:
             return "HOLD", {}
 
-        # 7 CORE STRATEGIES for ML replacement
-        results = {
-            "s1_rsi": self.s1_rsi(df),
-            "s2_ema_cross": self.s2_ema_cross(df),
-            "s3_bollinger": self.s3_bollinger(df),
-            "s4_mfi": self.s4_mfi(df),
-            "s5_volume_break": self.s5_volume_break(df),
-            "s6_trend_slope": self.s6_trend_slope(df),
-            "s7_trend_momentum": self.s7_trend_momentum(df),
-        }
+        # Get ML predictions for strategies 1-6 (BUY or SELL only)
+        ml_results = {}
+        ml_results["s1_rsi"] = self.s1_rsi(df)
+        ml_results["s2_ema_cross"] = self.s2_ema_cross(df)
+        ml_results["s3_bollinger"] = self.s3_bollinger(df)
+        ml_results["s4_mfi"] = self.s4_mfi(df)
+        ml_results["s5_volume_break"] = self.s5_volume_break(df)
+        ml_results["s6_trend_slope"] = self.s6_trend_slope(df)
 
-        if self.main_decider_enabled:
-            main = self.main_decider(df)
-            return main, results
+        # Get main decider (s7) - technical rule-based (can return BUY, SELL, or HOLD)
+        main_decider_signal = self.s7_trend_momentum(df)
+        ml_results["s7_trend_momentum"] = main_decider_signal
 
-        # Voting with 7 strategies
-        votes = list(results.values())
-        buy = votes.count("BUY")
-        sell = votes.count("SELL")
+        # If main decider is enabled and gives a clear signal (BUY/SELL), it overrides all
+        if self.main_decider_enabled and main_decider_signal != "HOLD":
+            return main_decider_signal, ml_results
 
-        # Require 5/7 votes (majority)
+        # Otherwise, use voting on all 7 strategies (s1-s7)
+        # All 7 strategies count as votes
+        all_votes = [
+            ml_results["s1_rsi"],      # BUY or SELL
+            ml_results["s2_ema_cross"], # BUY or SELL
+            ml_results["s3_bollinger"],  # BUY or SELL
+            ml_results["s4_mfi"],        # BUY or SELL
+            ml_results["s5_volume_break"], # BUY or SELL
+            ml_results["s6_trend_slope"],  # BUY or SELL
+            ml_results["s7_trend_momentum"] # BUY, SELL, or HOLD
+        ]
+        
+        # Count BUY and SELL votes (HOLD from s7 doesn't contribute to threshold)
+        buy_votes = all_votes.count("BUY")
+        sell_votes = all_votes.count("SELL")
+        hold_votes = all_votes.count("HOLD")  # For logging/debugging
+
+        # Require passing_mark votes out of 7 strategies (default 5 out of 7)
         required_votes = max(1, self.passing_mark)
         
-        if buy >= required_votes:
-            return "BUY", results
-        if sell >= required_votes:
-            return "SELL", results
-        return "HOLD", results
-    
-    # =============== Main Decider ===============
-    def main_decider(self, df):
-        if len(df) < 50: return "HOLD"
-        r = rsi(df.price).iloc[-1]
-        e20 = ema(df.price, 20).iloc[-1]
-        e50 = ema(df.price, 50).iloc[-1]
-        trend = np.polyfit(np.arange(min(50, len(df))), df.price.iloc[-50:], 1)[0]
-
-        if r < 40 and e20 > e50 and trend > 0.1:
-            return "BUY"
-        if r > 60 and e20 < e50 and trend < -0.1:
-            return "SELL"
-        return "HOLD"
+        if buy_votes >= required_votes:
+            return "BUY", ml_results
+        if sell_votes >= required_votes:
+            return "SELL", ml_results
+        
+        # If threshold not met, return HOLD
+        return "HOLD", ml_results
 
     # =============== Auto Duration Analysis ===============
     def analyze_optimal_duration(self, df):

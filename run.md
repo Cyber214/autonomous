@@ -167,3 +167,16 @@ Telegram interface for both alerts and configuration (runtime schedule, loss lim
 Persistent logging and safe demo-mode support using Deriv demo credentials.
 
 Clean, readable code with comments for customization.
+
+there are 9 strategies or rather technical analyses i told you i only want 7 so that after that we can convert the 7 and go to phase 2
+Phase 2 could be - 
+Monitor performance for a few days
+
+Adjust strategy parameters based on results
+
+replace all 7 rule-based strategies with ML models!
+
+Add more markets (XAU/USD, etc.)
+
+this is meant to analyze and predict market make its own professional trades at any duration at its own Self-determination or discretion and earn money 
+not just on binary market but mainly for forex

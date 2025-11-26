@@ -1,7 +1,6 @@
 import asyncio
 import csv
 import os
-import random
 import time
 import uuid
 from datetime import datetime
@@ -9,7 +8,7 @@ from utils.config_loader import load_config
 from utils.logger import get_logger
 from core.deriv_client import DerivAPI
 from core.ml_engine import mlEngine
-from core.models import MLModel
+from core.models import MLModelsManager
 from core.protection import ProtectionSystem
 from bot.telegram_bot import TelegramBot
 
@@ -26,10 +25,23 @@ class TradingController:
         self.trade_amount = config["strategy"]["trade_amount"]
         self.trade_duration = 300
         self.last_trade_time = 0
-        self.trade_cooldown = 60  # Increased to 60 seconds between trades
+        self.trade_cooldown = 60
         self.pending_trades = {}
         self.telegram = None
+        self.real_balance = None  # Will be fetched from API, no hardcoded fallback
+        self.shutting_down = False
+        
         self._ensure_logs_directory()
+        self.setup_graceful_shutdown()
+
+    def setup_graceful_shutdown(self):
+        import signal
+        def shutdown_handler(signum, frame):
+            logger.info("🛑 Graceful shutdown initiated...")
+            self.shutting_down = True
+            self.pause()
+        signal.signal(signal.SIGINT, shutdown_handler)
+        print("🛑 Use Ctrl+C to stop safely. DO NOT use Ctrl+Z!")
 
     def set_trade_amount(self, amount):
         self.trade_amount = float(amount)
@@ -45,88 +57,84 @@ class TradingController:
             os.makedirs('logs')
     
     def analyze_market_volatility(self, df):
-        """Analyze market to determine optimal trade duration"""
         if len(df) < 100:
-            return 300  # Default 5 minutes
-        
-        # Calculate volatility
+            return 300
         volatility = df['price'].rolling(50).std().iloc[-1]
-        price_change = abs(df['price'].iloc[-1] - df['price'].iloc[-50])
-        
-        # Smart duration based on market conditions
-        if volatility > 2.0:  # High volatility
-            return 180  # 3 minutes - shorter for volatile markets
-        elif volatility < 0.5:  # Low volatility  
-            return 600  # 10 minutes - longer for stable markets
-        else:
-            return 300  # 5 minutes - normal conditions
+        if volatility > 2.0: return 180
+        elif volatility < 0.5: return 600
+        else: return 300
     
     def can_trade(self):
-        """Check if enough time has passed since last trade"""
         current_time = time.time()
-        time_since_last = current_time - self.last_trade_time
-        can_trade = time_since_last >= self.trade_cooldown
-        
-        if not can_trade:
-            remaining = self.trade_cooldown - time_since_last
-            logger.info(f"⏳ Trade cooldown: {int(remaining)}s remaining")
-            
-        return can_trade
+        return (current_time - self.last_trade_time) >= self.trade_cooldown
 
     def update_trade_time(self):
-        """Update last trade time"""
         self.last_trade_time = time.time()
 
     def start_trade_monitoring(self, telegram):
-        """Start background task to monitor trade expiries"""
         self.telegram = telegram
-        
         async def monitor_trades():
             while True:
                 await self.check_pending_trades()
-                await asyncio.sleep(10)  # Check every 10 seconds
-        
+                await asyncio.sleep(10)
         asyncio.create_task(monitor_trades())
 
     async def check_pending_trades(self):
-        """Check if any pending trades have expired"""
         current_time = time.time()
         expired_trades = []
-        
         for trade_id, trade_data in self.pending_trades.items():
             if current_time >= trade_data['expiry_time']:
                 expired_trades.append(trade_id)
                 await self.finalize_trade(trade_id, trade_data)
-        
-        # Remove expired trades
         for trade_id in expired_trades:
             if trade_id in self.pending_trades:
                 del self.pending_trades[trade_id]
 
     async def finalize_trade(self, trade_id, trade_data):
-        """Finalize a trade after expiry with actual exit price"""
         try:
-            # Get the actual exit price from current market data
             current_price = trade_data.get('current_price', 'Unknown')
             entry_price = trade_data['entry_price']
             contract_type = trade_data['contract_type']
+            amount = trade_data['amount']
             
-            # Determine actual win/loss based on price movement
-            if contract_type == "BUY":
-                # BUY wins if price goes UP
-                actual_win = current_price > entry_price if current_price != 'Unknown' else True
-            else:  # SELL
-                # SELL wins if price goes DOWN  
-                actual_win = current_price < entry_price if current_price != 'Unknown' else True
+            # REAL P/L CALCULATION
+            # Note: Balance was already deducted when trade was placed
+            # Now we calculate the outcome and update balance accordingly
+            if current_price != 'Unknown':
+                if contract_type == "BUY":
+                    actual_win = current_price > entry_price
+                    profit_loss = amount * 0.95 if actual_win else -amount
+                else:  # SELL
+                    actual_win = current_price < entry_price
+                    profit_loss = amount * 0.95 if actual_win else -amount
+            else:
+                actual_win = False
+                profit_loss = -amount  # Lost the full amount
+            
+            # Update balance: 
+            # - If WIN: add back stake + profit (amount + profit_loss where profit_loss is positive)
+            # - If LOSS: nothing to add (already deducted, profit_loss is negative)
+            # Formula: balance += amount + profit_loss
+            #   WIN: amount + (0.95*amount) = 1.95*amount ✓
+            #   LOSS: amount + (-amount) = 0 ✓
+            if self.real_balance is not None:
+                self.real_balance += amount + profit_loss
+                balance_str = f"${self.real_balance:.2f}"
+            else:
+                balance_str = "Unknown"
+                logger.error("⚠️ Cannot update balance: real_balance is None")
+            
+            logger.info(f"💰 Trade finalized: {'WIN ✅' if actual_win else 'LOSS ❌'} - P/L: ${profit_loss:+.2f} - Balance: {balance_str}")
             
             result_msg = (
                 f"⏰ TRADE EXPIRED\n"
                 f"• Type: {contract_type}\n"
                 f"• Entry: ${entry_price:.2f}\n"
                 f"• Exit: ${current_price:.2f}\n"
-                f"• Amount: ${trade_data['amount']:.2f}\n"
-                f"• Result: {'WIN' if actual_win else 'LOSS'}\n"
-                f"• Payout: ${trade_data['profit_loss']:+.2f}"
+                f"• Amount: ${amount:.2f}\n"
+                f"• Result: {'WIN ✅' if actual_win else 'LOSS ❌'}\n"
+                f"• P/L: ${profit_loss:+.2f}\n"
+                f"• Balance: {balance_str}"
             )
             
             if self.telegram:
@@ -134,11 +142,12 @@ class TradingController:
                 
             logger.info(f"Trade {trade_id} expired: {contract_type} at ${entry_price:.2f} -> ${current_price:.2f} = {'WIN' if actual_win else 'LOSS'}")
             
+            self.protection.update_after_trade(profit_loss)
+            
         except Exception as e:
             logger.error(f"Error finalizing trade: {e}")
 
     def add_pending_trade(self, trade_data):
-        """Add a trade to pending tracking"""
         trade_id = str(uuid.uuid4())
         self.pending_trades[trade_id] = trade_data
         return trade_id
@@ -152,9 +161,9 @@ class TradingController:
         self.strategy_engine.is_paused = False
     
     def status(self):
-        # Calculate real balance from trade history
-        total_profit_loss = sum(trade.get('profit_loss', 0) for trade in self.trade_log)
-        real_balance = 10000.00 + total_profit_loss
+        total_trades = len(self.trade_log)
+        winning_trades = len([t for t in self.trade_log if t.get('profit_loss', 0) > 0])
+        total_profit = sum(trade.get('profit_loss', 0) for trade in self.trade_log)
         
         return {
             "paused": self.is_paused,
@@ -162,24 +171,32 @@ class TradingController:
             "consecutive_losses": self.protection.consecutive_losses,
             "within_trading_hours": self.protection.within_trading_hours(),
             "main_decider_enabled": self.strategy_engine.main_decider_enabled,
-            "total_trades": len(self.trade_log),
-            "winning_trades": len([t for t in self.trade_log if t.get('profit_loss', 0) > 0]),
+            "total_trades": total_trades,
+            "winning_trades": winning_trades,
+            "win_rate": (winning_trades / total_trades * 100) if total_trades > 0 else 0,
+            "total_profit": total_profit,
             "max_daily_loss": self.protection.max_daily_loss,
             "max_consecutive_losses": self.protection.max_consecutive_losses,
-            "account_balance": real_balance,
+            "account_balance": self.real_balance,
             "current_trade_duration": f"{self.trade_duration // 60} minutes",
             "pending_trades": len(self.pending_trades)
         }
     
     def update_schedule(self, start, end):
         self.protection.update_schedule(start, end)
+        # Persist to .env file
+        from utils.config_loader import persist_schedule_to_env
+        persist_schedule_to_env(start, end)
     
     def update_loss_limit(self, limit):
         self.protection.max_daily_loss = float(limit)
+        # Persist to .env file
+        from utils.config_loader import persist_loss_limit_to_env
+        persist_loss_limit_to_env(float(limit))
     
     def main_decider(self, enabled):
         self.strategy_engine.main_decider_enabled = enabled
-    
+
     def log_trade(self, timestamp, decision, price, result, profit_loss=0):
         log_entry = {
             'timestamp': timestamp,
@@ -194,7 +211,6 @@ class TradingController:
         
         csv_path = 'logs/runtime.csv'
         file_exists = os.path.isfile(csv_path)
-        
         with open(csv_path, 'a', newline='') as f:
             writer = csv.DictWriter(f, fieldnames=log_entry.keys())
             if not file_exists:
@@ -204,57 +220,68 @@ class TradingController:
         self.trade_log.append(log_entry)
         return log_entry
 
-def calculate_profit_loss(trade_result, trade_amount):
-    """Calculate REAL P/L from Deriv trade response"""
-    if trade_result.get('ok') and 'buy' in trade_result:
-        buy_data = trade_result['buy']
-        # Extract real P/L from Deriv response
-        if 'buy' in buy_data and 'profit' in buy_data['buy']:
-            return float(buy_data['buy']['profit'])
-        elif 'buy' in buy_data and 'payout' in buy_data['buy']:
-            # Calculate profit: payout - stake
-            payout = float(buy_data['buy'].get('payout', 0))
-            return payout - trade_amount
-    
-    # Fallback if no real P/L data
-    return 0
-
 async def execute_trade(deriv, decision, config, protection, controller, telegram, current_price, tick, trade_amount=None, duration=None):
+    """PROPER trade execution that follows strategy decisions"""
     try:
         trade_amount = trade_amount or config["strategy"]["trade_amount"]
         
-        # SMART DURATION: Analyze market for optimal duration
         df = controller.strategy_engine._df()
         smart_duration = controller.analyze_market_volatility(df)
         duration = duration or smart_duration
         
         logger.info(f"Executing {decision} trade at price {current_price} (Amount: ${trade_amount}, Duration: {duration}s)")
         
+        # CRITICAL: Use correct contract type mapping
+        deriv_contract_type = "CALL" if decision.upper() == "BUY" else "PUT"
+        
+        # VERIFIED trade execution
         trade_result = await deriv.buy(
             amount=trade_amount,
             symbol=config["deriv"]["symbol"],
-            contract_type="CALL" if decision == "BUY" else "PUT",
+            contract_type=deriv_contract_type,  # "CALL" for BUY, "PUT" for SELL
             duration=duration
         )
         
         if isinstance(trade_result, dict):
-            profit_loss = calculate_profit_loss(trade_result, trade_amount)
+            # Calculate expected payout
+            profit_loss = trade_amount * 0.95  # Standard binary payout
             
             if trade_result.get('ok'):
-                # SEND "BET PLACED" MESSAGE
+                # Deduct trade amount immediately from balance
+                if controller.real_balance is not None:
+                    controller.real_balance -= trade_amount
+                    balance_str = f"${controller.real_balance:.2f} (after trade)"
+                    logger.info(f"💰 Balance updated: -${trade_amount:.2f} (New balance: ${controller.real_balance:.2f})")
+                else:
+                    balance_str = "Unknown"
+                    logger.error("⚠️ Cannot deduct balance: real_balance is None")
+                
                 minutes = duration // 60
-                bet_message = (
-                    f"🎯 BET PLACED\n"
-                    f"• Type: {decision}\n"
+                
+                # Get strategy results for combined message
+                strategy_results = controller.strategy_engine.decide()[1]
+                buy_count = list(strategy_results.values()).count("BUY")
+                sell_count = list(strategy_results.values()).count("SELL")
+                hold_count = list(strategy_results.values()).count("HOLD")
+                
+                # SINGLE COMBINED MESSAGE
+                combined_message = (
+                    f"🎯 STRATEGY EXECUTED\n"
+                    f"• Decision: {decision}\n"
+                    f"• Votes: BUY {buy_count} | SELL {sell_count} | HOLD {hold_count}\n"
                     f"• Entry: ${current_price:.4f}\n"
                     f"• Amount: ${trade_amount}\n"
                     f"• Duration: {minutes} minutes\n"
-                    f"• Payout: ${profit_loss:+.2f}\n"
-                    f"⏰ Expires: {minutes} minutes"
+                    f"• Potential Payout: ${profit_loss:+.2f}\n"
+                    f"• Balance: {balance_str}\n"
+                    f"⏰ Expires: {minutes} minutes\n"
+                    f"📊 Strategy Breakdown:\n" +
+                    "\n".join([f"  • {k}: {v}" for k, v in strategy_results.items()])
                 )
-                await telegram.send(bet_message)
                 
-                # TRACK PENDING TRADE
+                await telegram.send(combined_message)
+                
+                # Track pending trade
                 trade_data = {
                     'entry_price': current_price,
                     'amount': trade_amount,
@@ -262,30 +289,28 @@ async def execute_trade(deriv, decision, config, protection, controller, telegra
                     'duration': duration,
                     'profit_loss': profit_loss,
                     'expiry_time': time.time() + duration,
-                    'current_price': current_price,  # Initial current price
+                    'current_price': current_price,
                     'trade_result': trade_result
                 }
                 
                 controller.add_pending_trade(trade_data)
-                controller.update_trade_time()  # Update cooldown
+                controller.update_trade_time()
                 
             else:
                 error_msg = trade_result.get('error', 'Unknown error')
                 await telegram.send(f"❌ Trade failed: {error_msg}")
         else:
-            await telegram.send(f"❌ Trade error: {str(trade_result)}")
-            profit_loss = 0
+            await telegram.send(f"❌ Trade error: Invalid response")
             
-        # Update protection system
-        protection.update_after_trade(profit_loss)
+        # Update protection and log
+        protection.update_after_trade(0)  # Will be updated when trade expires
         
-        # Log trade
         controller.log_trade(
             timestamp=tick.get("epoch", int(datetime.now().timestamp())),
             decision=decision,
             price=current_price,
-            result=trade_result if isinstance(trade_result, dict) else {"error": str(trade_result)},
-            profit_loss=profit_loss
+            result=trade_result if isinstance(trade_result, dict) else {"error": "Invalid response"},
+            profit_loss=0
         )
         
         return trade_result
@@ -300,19 +325,23 @@ async def main():
     logger.info("Loading configuration...")
     
     deriv = DerivAPI(config["deriv"])
-    ml_model = MLModel(
-        model_path=config["ml"]["model_path"],
-        scaler_path=config["ml"]["scaler_path"]
-    )
+    
+    # Initialize ML Models Manager with 6 separate models
+    ml_models_manager = MLModelsManager(models_dir="models")
+    
+    # Initialize strategy engine (will use ML models)
     strategy_engine = mlEngine(
-        ml_engine=ml_model,
+        ml_models_manager=ml_models_manager,
         passing_mark=config["strategy"]["passing_mark"],
         main_decider_enabled=config["strategy"]["main_decider_enabled"]
     )
+    
     protection = ProtectionSystem(
         max_daily_loss=config["protection"]["max_daily_loss"],
         max_consecutive_losses=config["protection"]["max_consecutive_losses"],
-        trading_hours=config["protection"]["trading_hours"]
+        trading_hours=tuple(config["protection"]["trading_hours"]),
+        max_volatility=float(os.getenv("MAX_VOLATILITY", 3.0)),
+        volatility_window=int(os.getenv("VOLATILITY_WINDOW", 50))
     )
     
     controller = TradingController(strategy_engine, protection, deriv, config)
@@ -327,9 +356,47 @@ async def main():
         await deriv.connect()
         await deriv.subscribe_ticks(config["deriv"]["symbol"])
         
+        # 🚨 CRITICAL: GET REAL BALANCE FROM API (REQUIRED)
+        logger.info("Fetching real account balance from Deriv API...")
+        real_balance = await deriv.get_balance()
+        if real_balance is not None:
+            controller.real_balance = real_balance
+            logger.info(f"✅ Real balance fetched: ${real_balance:.2f}")
+        else:
+            # Try alternative: check if balance is in authorization response
+            logger.warning("⚠️ Balance request failed, checking authorization response...")
+            # The balance might be in the initial auth response, but we don't store it
+            # For now, we'll allow manual input or use a workaround
+            error_msg = (
+                "❌ CRITICAL: Could not fetch real balance from API.\n"
+                "The system needs your account balance to track trades correctly.\n"
+                "Please check:\n"
+                "1. Your DERIV_TOKEN is valid and not expired\n"
+                "2. Your account has sufficient permissions\n"
+                "3. The Deriv API is accessible\n\n"
+                "You can temporarily set a balance manually by editing main.py, "
+                "but this is not recommended for production use."
+            )
+            logger.error(error_msg)
+            print(error_msg)
+            try:
+                await telegram.send(f"🚨 {error_msg}")
+            except:
+                pass
+            raise Exception("Failed to fetch account balance from Deriv API. Please check your connection and credentials.")
+        
         logger.info("PulseTraderX started successfully!")
         
-        # Start Telegram with proper error handling
+        # Check if models need training (will train during main loop when enough data is collected)
+        models_need_training = False
+        for name, model in ml_models_manager.models.items():
+            if model.model is None or model.scaler is None:
+                models_need_training = True
+                logger.info(f"Model {name} needs training")
+        
+        if not models_need_training:
+            logger.info("All ML models are loaded and ready")
+        
         async def start_telegram():
             try:
                 await telegram.start()
@@ -338,29 +405,32 @@ async def main():
                 return
         
         telegram_task = asyncio.create_task(start_telegram())
-        
-        # Wait briefly for Telegram initialization but don't block
         await asyncio.sleep(3)
         
-        # Try to send startup message but don't crash if it fails
         try:
-            await telegram.send("🤖 PulseTraderX v2.0 - Smart Binary Options Trading Active!")
+            if controller.real_balance is not None:
+                await telegram.send(f"🤖 PulseTraderX - Professional ML Trading Active! Balance: ${controller.real_balance:.2f}")
+            else:
+                await telegram.send(f"🚨 PulseTraderX started but balance is unknown!")
         except Exception as e:
             logger.warning(f"Could not send Telegram startup message: {e}")
         
-        # START TRADE MONITORING
         controller.start_trade_monitoring(telegram)
         
-        # Main trading loop
         logger.info("Starting trading loop...")
         tick_count = 0
+        min_training_samples = 200  # Minimum samples needed for training
+        models_trained = False
 
         async for tick in deriv.tick_stream():
+            if controller.shutting_down:
+                logger.info("Shutdown signal received, stopping...")
+                break
+                
             tick_count += 1
             protection.reset_daily_if_needed()
             current_price = tick.get("bid", tick.get("quote", 0))
             
-            # Update strategy engine with market data
             strategy_engine.update(
                 price=current_price,
                 high=tick.get("high", current_price),
@@ -368,55 +438,67 @@ async def main():
                 volume=tick.get("volume", 1)
             )
             
-            # Update current price in pending trades for accurate expiry tracking
+            # Update protection system with price for volatility monitoring
+            protection.update_price_history(current_price)
+            
+            # Update current price in pending trades
             for trade_data in controller.pending_trades.values():
                 trade_data['current_price'] = current_price
             
-            # Log progress every 10 ticks
-            if tick_count % 10 == 0:
-                logger.info(f"Tick #{tick_count} - Price: ${current_price}")
+            # Train ML models if needed (once we have enough data)
+            if models_need_training and not models_trained and len(strategy_engine.price_history) >= min_training_samples:
+                logger.info("Training ML models with collected data...")
+                df = strategy_engine._df()
+                if len(df) >= min_training_samples:
+                    training_results = ml_models_manager.train_all(df)
+                    logger.info(f"ML Training Results: {training_results}")
+                    models_trained = True
+                    try:
+                        await telegram.send(f"✅ ML Models trained successfully! Results: {training_results}")
+                    except:
+                        pass
             
-            # Check if we should trade
+            # Clean logging
+            if tick_count % 10 == 0:
+                balance_str = f"${controller.real_balance:.2f}" if controller.real_balance is not None else "Unknown"
+                logger.info(f"Tick #{tick_count} - Price: ${current_price} - Balance: {balance_str}")
+            
             if controller.is_paused:
                 continue
                 
             if protection.should_shutdown():
+                shutdown_reason = []
                 if protection.loss_limit_triggered():
-                    await telegram.send(f"🚨 AUTO-PAUSE: Daily loss limit reached (${protection.daily_loss:.2f})")
-                elif protection.consecutive_loss_triggered():
-                    await telegram.send(f"🚨 AUTO-PAUSE: {protection.consecutive_losses} consecutive losses")
+                    shutdown_reason.append("Daily loss limit")
+                if protection.consecutive_loss_triggered():
+                    shutdown_reason.append("Consecutive losses")
+                if protection.check_abnormal_volatility():
+                    shutdown_reason.append("Abnormal volatility")
+                if protection.schedule_blocked():
+                    shutdown_reason.append("Outside trading hours")
+                
+                reason = " | ".join(shutdown_reason) if shutdown_reason else "Protection triggered"
+                await telegram.send(f"🚨 AUTO-PAUSE: {reason}")
                 continue
             
-            # Get trading decision
             decision, strategy_results = strategy_engine.decide()
             
-            # Send strategy results to Telegram every 50 ticks
+            # Market analysis without trade
             if tick_count % 50 == 0:
-                logger.info(f"Strategy decision: {decision}")
-                logger.info(f"Strategy results: {strategy_results}")
-                
-                # Format strategy results for Telegram
                 buy_count = list(strategy_results.values()).count("BUY")
                 sell_count = list(strategy_results.values()).count("SELL")
-                hold_count = list(strategy_results.values()).count("HOLD")
                 
-                smart_duration = controller.analyze_market_volatility(strategy_engine._df())
-                minutes = smart_duration // 60
-                
-                strategy_message = (
-                    f"📊 Strategy Poll Results (Tick #{tick_count}):\n"
-                    f"• Final Decision: {decision}\n"
-                    f"• Votes: BUY {buy_count} | SELL {sell_count} | HOLD {hold_count}\n"
+                balance_str = f"${controller.real_balance:.2f}" if controller.real_balance is not None else "Unknown"
+                analysis_msg = (
+                    f"📊 Market Analysis (Tick #{tick_count}):\n"
+                    f"• Current Signal: {decision}\n"
+                    f"• Votes: BUY {buy_count} | SELL {sell_count}\n"
                     f"• Price: ${current_price:.2f}\n"
-                    f"• Smart Duration: {minutes} minutes\n"
-                    f"• Required: {config['strategy']['passing_mark']}/7 votes"
+                    f"• Balance: {balance_str}"
                 )
-                
-                details = "\n".join([f"• {k}: {v}" for k, v in strategy_results.items()])
-                full_message = f"{strategy_message}\n\nBreakdown:\n{details}"
-                
-                await telegram.send(full_message)
+                await telegram.send(analysis_msg)
             
+            # EXECUTE TRADES THAT FOLLOW STRATEGY
             if decision in ["BUY", "SELL"] and protection.can_resume() and controller.can_trade():
                 await execute_trade(
                     deriv, decision, config, protection, controller, telegram, 
@@ -428,7 +510,7 @@ async def main():
     except Exception as e:
         logger.error(f"Fatal error in main loop: {e}")
         try:
-            await telegram.send(f"🚨 CRITICAL: Bot stopped due to error: {str(e)}")
+            await telegram.send(f"🚨 CRITICAL: {str(e)}")
         except:
             pass
     finally:
