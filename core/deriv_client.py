@@ -137,6 +137,30 @@ class DerivAPI:
                 self.connected = False
                 break
 
+    async def change_symbol(self, new_symbol: str):
+        """Switch the active trading symbol"""
+        normalized = new_symbol.strip().upper().replace("/", "")
+        if not normalized:
+            raise ValueError("Invalid symbol")
+        if normalized == self.symbol:
+            return True
+        
+        self.symbol = normalized
+        self._already_subscribed = False
+        logger.info(f"🔄 Switching market to {self.symbol}")
+        
+        if self.connected and self.ws:
+            try:
+                # Forget previous tick subscriptions if possible
+                await self.ws.send(json.dumps({"forget_all": "ticks"}))
+            except Exception as e:
+                logger.warning(f"Could not forget previous ticks: {e}")
+            
+            # Subscribe to the new symbol
+            await self.subscribe_ticks(self.symbol)
+        
+        return True
+
     async def _attempt_reconnect(self):
         if self._reconnect_attempts >= self.max_reconnect_attempts:
             logger.error("❌ Max reconnection attempts reached")

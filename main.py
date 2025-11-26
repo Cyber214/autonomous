@@ -4,6 +4,7 @@ import os
 import time
 import uuid
 from datetime import datetime
+import pandas as pd
 from utils.config_loader import load_config
 from utils.logger import get_logger
 from core.deriv_client import DerivAPI
@@ -30,6 +31,7 @@ class TradingController:
         self.telegram = None
         self.real_balance = None  # Will be fetched from API, no hardcoded fallback
         self.shutting_down = False
+        self.active_protection_reason = None
         
         self._ensure_logs_directory()
         self.setup_graceful_shutdown()
@@ -124,13 +126,39 @@ class TradingController:
                 balance_str = "Unknown"
                 logger.error("⚠️ Cannot update balance: real_balance is None")
             
-            logger.info(f"💰 Trade finalized: {'WIN ✅' if actual_win else 'LOSS ❌'} - P/L: ${profit_loss:+.2f} - Balance: {balance_str}")
+            # Enhanced logging for analysis
+            price_change = current_price - entry_price if current_price != 'Unknown' else 0
+            price_change_pct = (price_change / entry_price * 100) if entry_price > 0 else 0
+            
+            logger.info(
+                f"💰 Trade finalized: {'WIN ✅' if actual_win else 'LOSS ❌'} - "
+                f"Type: {contract_type} - "
+                f"Entry: ${entry_price:.4f} → Exit: ${current_price:.4f} "
+                f"({price_change:+.4f}, {price_change_pct:+.2f}%) - "
+                f"P/L: ${profit_loss:+.2f} - Balance: {balance_str}"
+            )
+            
+            # Update the trade log with final outcome
+            # Find the trade in log and update it
+            for log_entry in self.trade_log:
+                if (log_entry.get('entry_price') == entry_price and 
+                    log_entry.get('decision') == contract_type and
+                    log_entry.get('exit_price') is None):
+                    log_entry['exit_price'] = current_price if current_price != 'Unknown' else None
+                    log_entry['price_change'] = price_change if current_price != 'Unknown' else None
+                    log_entry['price_change_pct'] = price_change_pct if current_price != 'Unknown' else None
+                    log_entry['profit_loss'] = profit_loss
+                    log_entry['outcome'] = 'WIN' if actual_win else 'LOSS'
+                    # Update CSV file
+                    self._update_trade_in_csv(log_entry)
+                    break
             
             result_msg = (
                 f"⏰ TRADE EXPIRED\n"
                 f"• Type: {contract_type}\n"
-                f"• Entry: ${entry_price:.2f}\n"
-                f"• Exit: ${current_price:.2f}\n"
+                f"• Entry: ${entry_price:.4f}\n"
+                f"• Exit: ${current_price:.4f}\n"
+                f"• Price Change: {price_change:+.4f} ({price_change_pct:+.2f}%)\n"
                 f"• Amount: ${amount:.2f}\n"
                 f"• Result: {'WIN ✅' if actual_win else 'LOSS ❌'}\n"
                 f"• P/L: ${profit_loss:+.2f}\n"
@@ -193,32 +221,129 @@ class TradingController:
         # Persist to .env file
         from utils.config_loader import persist_loss_limit_to_env
         persist_loss_limit_to_env(float(limit))
+
+    async def change_market(self, new_symbol):
+        normalized = new_symbol.strip().upper()
+        if not normalized:
+            raise ValueError("Symbol cannot be empty")
+
+        # Update deriv client
+        await self.deriv_client.change_symbol(normalized)
+
+        # Reset strategy history to avoid mixing data
+        self.strategy_engine.reset_history()
+
+        # Update current config
+        self.config["deriv"]["symbol"] = normalized
+
+        logger.info(f"✅ Market switched to {normalized}")
+        return normalized
     
     def main_decider(self, enabled):
         self.strategy_engine.main_decider_enabled = enabled
 
-    def log_trade(self, timestamp, decision, price, result, profit_loss=0):
+    async def notify_protection(self, reason, telegram):
+        """Send protection alert only when reason changes"""
+        if self.active_protection_reason != reason:
+            self.active_protection_reason = reason
+            await telegram.send(f"🚨 AUTO-PAUSE: {reason}")
+    
+    def clear_protection_alert(self):
+        self.active_protection_reason = None
+    
+    def log_trade(self, timestamp, decision, price, result, profit_loss=0, entry_price=None, exit_price=None, outcome=None):
         log_entry = {
             'timestamp': timestamp,
             'datetime': datetime.now().isoformat(),
-            'decision': decision,
-            'price': price,
+            'decision': decision,  # BUY or SELL
+            'price': price,  # Entry price
+            'entry_price': entry_price or price,
+            'exit_price': exit_price,
+            'price_change': (exit_price - entry_price) if (exit_price and entry_price) else None,
+            'price_change_pct': ((exit_price - entry_price) / entry_price * 100) if (exit_price and entry_price and entry_price > 0) else None,
             'profit_loss': profit_loss,
             'result': 'SUCCESS' if result.get('ok') else 'FAILED',
+            'outcome': outcome,  # 'WIN' or 'LOSS' or None
             'contract_type': 'CALL' if decision == "BUY" else 'PUT',
             'duration': self.trade_duration
         }
         
         csv_path = 'logs/runtime.csv'
         file_exists = os.path.isfile(csv_path)
+        
+        # Get all fieldnames (handle new fields being added)
+        fieldnames = [
+            'timestamp', 'datetime', 'decision', 'price', 'entry_price', 'exit_price',
+            'price_change', 'price_change_pct', 'profit_loss', 'result', 'outcome',
+            'contract_type', 'duration'
+        ]
+        
         with open(csv_path, 'a', newline='') as f:
-            writer = csv.DictWriter(f, fieldnames=log_entry.keys())
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
             if not file_exists:
                 writer.writeheader()
             writer.writerow(log_entry)
         
         self.trade_log.append(log_entry)
         return log_entry
+    
+    def _update_trade_in_csv(self, updated_entry):
+        """Update a trade entry in the CSV file"""
+        csv_path = 'logs/runtime.csv'
+        if not os.path.exists(csv_path):
+            return
+        
+        try:
+            # Read all entries with error handling for inconsistent field counts
+            try:
+                df = pd.read_csv(csv_path, on_bad_lines='skip')
+            except:
+                # Fallback: read manually if pandas fails
+                import csv as csv_module
+                rows = []
+                with open(csv_path, 'r') as f:
+                    reader = csv_module.DictReader(f)
+                    for row in reader:
+                        rows.append(row)
+                if not rows:
+                    return
+                df = pd.DataFrame(rows)
+            
+            # Ensure all expected columns exist
+            expected_cols = ['entry_price', 'exit_price', 'price_change', 'price_change_pct', 'profit_loss', 'outcome']
+            for col in expected_cols:
+                if col not in df.columns:
+                    df[col] = None
+            
+            # Find and update the matching entry
+            # Match by entry_price, decision, and missing exit_price
+            if 'entry_price' in df.columns and 'decision' in df.columns:
+                # Convert entry_price to numeric for comparison
+                df['entry_price'] = pd.to_numeric(df['entry_price'], errors='coerce')
+                entry_price_val = updated_entry.get('entry_price')
+                if entry_price_val:
+                    entry_price_val = float(entry_price_val)
+                
+                mask = (
+                    (df['entry_price'] == entry_price_val) &
+                    (df['decision'] == updated_entry.get('decision'))
+                )
+                
+                # Also check if exit_price is missing
+                if 'exit_price' in df.columns:
+                    mask = mask & (df['exit_price'].isna() | (df['exit_price'] == ''))
+                
+                if mask.any():
+                    for col in expected_cols:
+                        if col in updated_entry and updated_entry[col] is not None:
+                            df.loc[mask, col] = updated_entry[col]
+                    
+                    # Write back to CSV
+                    df.to_csv(csv_path, index=False)
+        except Exception as e:
+            logger.error(f"Error updating trade in CSV: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
 
 async def execute_trade(deriv, decision, config, protection, controller, telegram, current_price, tick, trade_amount=None, duration=None):
     """PROPER trade execution that follows strategy decisions"""
@@ -310,7 +435,10 @@ async def execute_trade(deriv, decision, config, protection, controller, telegra
             decision=decision,
             price=current_price,
             result=trade_result if isinstance(trade_result, dict) else {"error": "Invalid response"},
-            profit_loss=0
+            profit_loss=0,
+            entry_price=current_price,
+            exit_price=None,  # Will be updated when trade expires
+            outcome=None  # Will be updated when trade expires
         )
         
         return trade_result
@@ -478,8 +606,10 @@ async def main():
                     shutdown_reason.append("Outside trading hours")
                 
                 reason = " | ".join(shutdown_reason) if shutdown_reason else "Protection triggered"
-                await telegram.send(f"🚨 AUTO-PAUSE: {reason}")
+                await controller.notify_protection(reason, telegram)
                 continue
+            else:
+                controller.clear_protection_alert()
             
             decision, strategy_results = strategy_engine.decide()
             

@@ -289,3 +289,10 @@ class mlEngine:
             return 600  # Low volatility → 10 minutes
         else:
             return 300  # Medium volatility → 5 minutes
+
+    def reset_history(self):
+        """Clear stored market history when switching symbols"""
+        self.price_history.clear()
+        self.high_history.clear()
+        self.low_history.clear()
+        self.volume_history.clear()

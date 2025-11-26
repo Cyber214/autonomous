@@ -42,6 +42,7 @@ class TelegramBot:
         self.app.add_handler(CommandHandler("autoduration", self.cmd_autoduration))
         self.app.add_handler(CommandHandler("smartduration", self.cmd_smartduration))
         self.app.add_handler(CommandHandler("analyze", self.cmd_analyze))
+        self.app.add_handler(CommandHandler("moveto", self.cmd_moveto))
 
         self._is_running = True
         print("🤖 Telegram Bot Started - Waiting for messages...")
@@ -81,6 +82,7 @@ class TelegramBot:
             "• /setduration 300 - Set trade duration (seconds)\n"
             "• /smartduration - Auto-set optimal duration\n"
             "• /autoduration - Auto-set duration based on volatility\n\n"
+            "• /moveto XAUUSD - Switch trading market/symbol\n\n"
             "📊 Bot monitors R_100 with 7 strategies for 3-10 minute Binary Options trades"
         )
         await update.message.reply_text(help_text)
@@ -206,3 +208,15 @@ class TelegramBot:
             f"• Data Points: {len(df)} ticks"
         )
         await update.message.reply_text(analysis)
+
+    async def cmd_moveto(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Switch trading market symbol"""
+        if not context.args:
+            await update.message.reply_text("Usage: /moveto XAUUSD or /moveto XAU/USD")
+            return
+        new_symbol = context.args[0].upper().replace("/", "")
+        try:
+            await self.controller.change_market(new_symbol)
+            await update.message.reply_text(f"🔄 Switched market to {new_symbol}. Collecting new data...")
+        except Exception as e:
+            await update.message.reply_text(f"❌ Failed to switch market: {e}")
