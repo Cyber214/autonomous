@@ -25,6 +25,8 @@ class TradingController:
         self.trade_log = []
         self.trade_amount = config["strategy"]["trade_amount"]
         self.trade_duration = 300
+        self.duration_source = "manual"
+        self.duration_last_updated = datetime.now()
         self.last_trade_time = 0
         self.trade_cooldown = 60
         self.pending_trades = {}
@@ -49,10 +51,12 @@ class TradingController:
         self.trade_amount = float(amount)
         print(f"💰 Trade amount set to: ${self.trade_amount}")
     
-    def set_trade_duration(self, duration):
+    def set_trade_duration(self, duration, source="manual"):
         self.trade_duration = int(duration)
-        minutes = duration // 60
-        print(f"⏱️ Trade duration set to: {minutes} minutes ({duration} seconds)")
+        self.duration_source = source
+        self.duration_last_updated = datetime.now()
+        minutes = duration / 60
+        print(f"⏱️ Trade duration set to: {minutes:.1f} minutes ({duration} seconds) via {source}")
     
     def _ensure_logs_directory(self):
         if not os.path.exists('logs'):
@@ -65,6 +69,48 @@ class TradingController:
         if volatility > 2.0: return 180
         elif volatility < 0.5: return 600
         else: return 300
+
+    def compute_ml_duration(self):
+        """Use ML confidence + market stats to choose trade duration"""
+        df = self.strategy_engine._df()
+        if len(df) < 120:
+            return max(180, min(600, self.trade_duration))
+        
+        # Get latest strategy votes without triggering trade
+        _, strategy_results = self.strategy_engine.decide()
+        ml_votes = [strategy_results[k] for k in strategy_results if k != "s7_trend_momentum"]
+        buy_votes = ml_votes.count("BUY")
+        sell_votes = ml_votes.count("SELL")
+        vote_strength = max(buy_votes, sell_votes) / max(1, len(ml_votes))
+        
+        # Market stats
+        price_series = df.price
+        volatility = price_series.pct_change().rolling(60).std().iloc[-1]
+        trend_window = min(len(price_series) - 1, 120)
+        trend_strength = abs(price_series.iloc[-1] - price_series.iloc[-trend_window]) / price_series.iloc[-trend_window]
+        
+        duration = 300
+        if vote_strength >= 0.8:
+            duration = 180 if volatility > 0.001 else 240
+        elif vote_strength <= 0.5:
+            duration = 420 if trend_strength < 0.001 else 360
+        else:
+            duration = 300 if volatility < 0.001 else 240
+        
+        if trend_strength < 0.0007 and volatility < 0.0008:
+            duration = 600  # Range-bound market
+        if trend_strength > 0.003 and vote_strength >= 0.7:
+            duration = 180
+        
+        return max(120, min(900, duration))
+    
+    def duration_status(self):
+        return {
+            "seconds": self.trade_duration,
+            "minutes": self.trade_duration / 60,
+            "source": self.duration_source,
+            "last_updated": self.duration_last_updated.strftime("%Y-%m-%d %H:%M:%S")
+        }
     
     def can_trade(self):
         current_time = time.time()

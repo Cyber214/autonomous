@@ -39,8 +39,8 @@ class TelegramBot:
         self.app.add_handler(CommandHandler("viewschedule", self.cmd_viewschedule))
         self.app.add_handler(CommandHandler("setamount", self.cmd_setamount))
         self.app.add_handler(CommandHandler("setduration", self.cmd_setduration))
-        self.app.add_handler(CommandHandler("autoduration", self.cmd_autoduration))
         self.app.add_handler(CommandHandler("smartduration", self.cmd_smartduration))
+        self.app.add_handler(CommandHandler("durationstatus", self.cmd_durationstatus))
         self.app.add_handler(CommandHandler("analyze", self.cmd_analyze))
         self.app.add_handler(CommandHandler("moveto", self.cmd_moveto))
 
@@ -71,8 +71,8 @@ class TelegramBot:
             "• /help - Show this help message\n"
             "• /status - Bot status & account balance\n"
             "• /analyze - Current market analysis\n"
-            "• /pause - Pause trading\n"
             "• /resume - Resume trading\n"
+            "• /pause - Pause trading\n"
             "• /mainon - Enable main decider (overrides voting)\n"
             "• /mainoff - Disable main decider (uses voting)\n"
             "• /setlosslimit 50 - Set max daily loss ($)\n"
@@ -80,10 +80,10 @@ class TelegramBot:
             "• /viewschedule - Show current trading hours\n\n"
             "• /setamount 5.00 - Set trade amount ($)\n"
             "• /setduration 300 - Set trade duration (seconds)\n"
-            "• /smartduration - Auto-set optimal duration\n"
-            "• /autoduration - Auto-set duration based on volatility\n\n"
+            "• /smartduration - ML-based duration optimization\n"
+            "• /durationstatus - Show current duration source/value\n\n"
             "• /moveto XAUUSD - Switch trading market/symbol\n\n"
-            "📊 Bot monitors R_100 with 7 strategies for 3-10 minute Binary Options trades"
+            "📊 Bot monitors with 7 strategies for 3-10 minute trades"
         )
         await update.message.reply_text(help_text)
     
@@ -157,34 +157,47 @@ class TelegramBot:
             await update.message.reply_text("Usage: /setamount 1.50")
 
     async def cmd_setduration(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Set trade duration in seconds or minutes"""
         try:
-            duration = int(update.message.text.split()[1])
-            self.controller.set_trade_duration(duration)
-            minutes = duration // 60
-            await update.message.reply_text(f"⏱️ Trade duration set to {minutes} minutes ({duration} seconds)")
-        except:
-            await update.message.reply_text("Usage: /setduration 300 (for 5 minutes)")
+            value = update.message.text.split()[1]
+            value = value.lower().strip()
+            
+            if value.endswith("m"):
+                minutes = float(value[:-1])
+                duration = int(minutes * 60)
+            elif value.endswith("s"):
+                duration = int(value[:-1])
+            else:
+                duration = int(value)
+            
+            if duration < 60 or duration > 3600:
+                await update.message.reply_text("Duration must be between 1 and 60 minutes.")
+                return
+            
+            self.controller.set_trade_duration(duration, source="manual")
+            minutes_display = duration / 60
+            await update.message.reply_text(f"⏱️ Trade duration set to {minutes_display:.1f} minutes ({duration} seconds)")
+        except Exception:
+            await update.message.reply_text("Usage: /setduration 5m or /setduration 300s")
 
-    async def cmd_autoduration(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        # Auto-analyze and set optimal duration
-        optimal_duration = self.controller.strategy_engine.analyze_optimal_duration(
-            self.controller.strategy_engine._df()
-        )
-        self.controller.set_trade_duration(optimal_duration)
-        minutes = optimal_duration // 60
-        await update.message.reply_text(f"🤖 Auto-set duration to {minutes} minutes based on market volatility")
-
-    # ------------------------------------------------------------
-    # NEW COMMANDS
-    # ------------------------------------------------------------
     async def cmd_smartduration(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Auto-set smart duration based on market conditions"""
-        df = self.controller.strategy_engine._df()
-        optimal_duration = self.controller.analyze_market_volatility(df)
-        self.controller.set_trade_duration(optimal_duration)
+        """Use ML + market data to select best trade duration"""
+        optimal_duration = self.controller.compute_ml_duration()
+        self.controller.set_trade_duration(optimal_duration, source="smart-ml")
         
         minutes = optimal_duration // 60
-        await update.message.reply_text(f"🤖 Smart duration set to {minutes} minutes based on current market volatility")
+        await update.message.reply_text(
+            f"🤖 Smart duration set to {minutes} minutes based on ML confidence and volatility"
+        )
+    
+    async def cmd_durationstatus(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show current duration configuration"""
+        status = self.controller.duration_status()
+        await update.message.reply_text(
+            f"⏱️ Duration: {status['minutes']:.1f} minutes ({status['seconds']}s)\n"
+            f"• Source: {status['source']}\n"
+            f"• Last Updated: {status['last_updated']}"
+        )
 
     async def cmd_analyze(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show current market analysis"""
