@@ -73,16 +73,16 @@ class TelegramBot:
             "• /analyze - Current market analysis\n"
             "• /resume - Resume trading\n"
             "• /pause - Pause trading\n"
-            "• /mainon - Enable main decider (overrides voting)\n"
-            "• /mainoff - Disable main decider (uses voting)\n"
-            "• /setlosslimit 50 - Set max daily loss ($)\n"
-            "• /setschedule 07:00-18:00 - Set trading hours\n"
-            "• /viewschedule - Show current trading hours\n\n"
-            "• /setamount 5.00 - Set trade amount ($)\n"
-            "• /setduration 300 - Set trade duration (seconds)\n"
+            "• /mainon - Enable main decider\n"
+            "• /mainoff - Disable main decider\n"
+            "• /setlosslimit - Set max daily loss ($)\n"
+            "• /setschedule - Set Trading hours\n"
+            "• /viewschedule - Current trading hours\n"
+            "• /setamount - Set trade amount ($)\n"
+            "• /setduration - Set trade duration\n"
             "• /smartduration - ML-based duration optimization\n"
-            "• /durationstatus - Show current duration source/value\n\n"
-            "• /moveto XAUUSD - Switch trading market/symbol\n\n"
+            "• /durationstatus - Show current duration\n"
+            "• /moveto - Switch trading market/symbol\n\n"
             "📊 Bot monitors with 7 strategies for 3-10 minute trades"
         )
         await update.message.reply_text(help_text)
@@ -115,7 +115,9 @@ class TelegramBot:
             f"• Consecutive Losses: {status['consecutive_losses']}/{status['max_consecutive_losses']}\n"
             f"• Trading Hours: {status['within_trading_hours']}\n"
             f"• Main Decider: {status['main_decider_enabled']}\n"
-            f"• Current Duration: {status['current_trade_duration']}"
+            f"• Current Duration: {status['current_trade_duration']}\n"
+            f"• Current Amount: ${self.controller.trade_amount}\n"
+            f"• Current Market: {self.controller.config['deriv']['symbol']}"
         )
         await update.message.reply_text(response)
 
@@ -154,7 +156,7 @@ class TelegramBot:
             self.controller.set_trade_amount(amount)
             await update.message.reply_text(f"💰 Trade amount set to ${amount}")
         except:
-            await update.message.reply_text("Usage: /setamount 1.50")
+            await update.message.reply_text("Usage: /setamount 10.50")
 
     async def cmd_setduration(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Set trade duration in seconds or minutes"""

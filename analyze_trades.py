@@ -45,6 +45,14 @@ def analyze_trades():
             return
         
         df = pd.DataFrame(rows)
+        # Convert numeric columns from strings
+        numeric_cols = ["entry_price", "signal_price", "price_before", "price_after",
+                        "price_change_pct", "profit_loss", "duration"]
+
+        for col in numeric_cols:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+
         
         if len(df) == 0:
             print("❌ Trade log is empty.")
@@ -81,6 +89,22 @@ def analyze_trades():
         print(f"Total Profit/Loss: ${total_profit:+.2f}")
         print(f"Average P/L per Trade: ${total_profit/len(completed):+.2f}")
         print()
+
+        # LOSS STATS
+        loss_count = len(completed) - len(wins)
+        loss_rate = (loss_count / len(completed) * 100) if len(completed) > 0 else 0
+
+        print(f"Loss Rate: {loss_rate:.1f}% ({loss_count}/{len(completed)})")
+        print(f"Total Losing Trades: {loss_count}")
+
+        # Optional: total and average loss P/L
+        if len(losses) > 0:
+            total_loss = losses['profit_loss'].sum()
+            avg_loss = total_loss / len(losses)
+            print(f"Total Loss P/L: ${total_loss:+.2f}")
+            print(f"Average Loss per Trade: ${avg_loss:+.2f}")
+
+
         
         # BUY vs SELL analysis
         buy_trades = completed[completed['decision'] == 'BUY']

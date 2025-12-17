@@ -189,28 +189,93 @@ class mlEngine:
             print(f"Error in s6_trend_slope ML prediction: {e}")
             return "BUY"
 
-    # ==================== MAIN DECIDER (s7) - Technical Rule-Based ====================
-    def s7_trend_momentum(self, df):
-        """
-        Main Technical Decider - Rule-based strategy that overrides all ML outputs
-        This is the deterministic technical analysis strategy
-        """
-        if len(df) < 50: 
-            return "HOLD"  # Main decider can return HOLD
-        
-        ema_20 = ema(df.price, 20)
-        ema_50 = ema(df.price, 50)
-        r = rsi(df.price).iloc[-1]
-        trend = np.polyfit(np.arange(min(50, len(df))), df.price.iloc[-50:], 1)[0]
-        
-        # Strong BUY signal
-        if r < 40 and ema_20.iloc[-1] > ema_50.iloc[-1] and trend > 0.1 and df.price.iloc[-1] > ema_20.iloc[-1]:
+#    # ==================== MAIN DECIDER (s7) - Technical Rule-Based ====================
+#    def s7_trend_momentum(self, df):
+#        """
+#        Main Technical Decider - Rule-based strategy that overrides all ML outputs
+#        This is the deterministic technical analysis strategy
+#        """
+#        if len(df) < 50: 
+#            return "HOLD"  # Main decider can return HOLD
+#        
+#        ema_20 = ema(df.price, 20)
+#        ema_50 = ema(df.price, 50)
+#        r = rsi(df.price).iloc[-1]
+#        trend = np.polyfit(np.arange(min(50, len(df))), df.price.iloc[-50:], 1)[0]
+#        
+#        # Strong BUY signal
+#        if r < 40 and ema_20.iloc[-1] > ema_50.iloc[-1] and trend > 0.1 and df.price.iloc[-1] > ema_20.iloc[-1]:
+#            return "BUY"
+#        
+#        # Strong SELL signal
+#        if r > 60 and ema_20.iloc[-1] < ema_50.iloc[-1] and trend < -0.1 and df.price.iloc[-1] < ema_20.iloc[-1]:
+#            return "SELL"
+#        
+#        return "HOLD"
+#    
+    # ==================== MAIN DECIDER (s7) - FVG BREAKOUT STRATEGY ====================
+    def s7_fvg_breakout(self, df):
+        if len(df) < 20:
+            return "HOLD"
+
+        # 1. First 5-min range
+        first5 = df.iloc[:5]
+        range_high = first5.high.max()
+        range_low = first5.low.min()
+
+        last = df.iloc[-1]
+        prev1 = df.iloc[-2]
+        prev2 = df.iloc[-3]
+
+        # 2. Breakout
+        breakout_up = last.price > range_high
+        breakout_down = last.price < range_low
+
+        if not breakout_up and not breakout_down:
+            return "HOLD"
+
+        # 3. FVG Detection (tick-friendly)
+        def detect_fvg(c1, c2, c3):
+            # Bullish FVG
+            if c1.high < c3.low and c2.price > c1.price:
+                return "BULL"
+            # Bearish FVG
+            if c1.low > c3.high and c2.price < c1.price:
+                return "BEAR"
+            return None
+
+        fvg = detect_fvg(prev2, prev1, last)
+
+        if breakout_up and fvg != "BULL":
+            return "HOLD"
+        if breakout_down and fvg != "BEAR":
+            return "HOLD"
+
+        # 4. Retest into gap
+        if fvg == "BULL":
+            gap_low = prev2.high
+            gap_high = last.low
+            retest = last.low <= gap_high and last.low >= gap_low
+        else:
+            gap_high = prev2.low
+            gap_low = last.high
+            retest = last.high >= gap_low and last.high <= gap_high
+
+        if not retest:
+            return "HOLD"
+
+        # 5. Engulf confirmation (tick-based)
+        body_last = abs(last.price - prev1.price)
+        body_prev = abs(prev1.price - prev2.price)
+
+        engulf_bull = prev1.price > last.price and fvg == "BULL"
+        engulf_bear = prev1.price < last.price and fvg == "BEAR"
+
+        if engulf_bull:
             return "BUY"
-        
-        # Strong SELL signal
-        if r > 60 and ema_20.iloc[-1] < ema_50.iloc[-1] and trend < -0.1 and df.price.iloc[-1] < ema_20.iloc[-1]:
+        if engulf_bear:
             return "SELL"
-        
+
         return "HOLD"
 
     # =============== Combined Decision ===============
@@ -221,9 +286,9 @@ class mlEngine:
         2. Get main decider signal (s7) - can output BUY/SELL/HOLD
         3. If main_decider_enabled and s7 is BUY/SELL, return s7's decision (overrides all)
         4. Otherwise, use voting on all 7 strategies:
-           - s1-s6: BUY or SELL only
-           - s7: BUY, SELL, or HOLD (HOLD counts as vote but doesn't contribute to threshold)
-           - Requires passing_mark votes (default 5 out of 7)
+            - s1-s6: BUY or SELL only
+            - s7: BUY, SELL, or HOLD (HOLD counts as vote but doesn't contribute to threshold)
+            - Requires passing_mark votes (default 5 out of 7)
         """
         df = self._df()
         if len(df) < 30 or self.is_paused:
@@ -239,8 +304,10 @@ class mlEngine:
         ml_results["s6_trend_slope"] = self.s6_trend_slope(df)
 
         # Get main decider (s7) - technical rule-based (can return BUY, SELL, or HOLD)
-        main_decider_signal = self.s7_trend_momentum(df)
-        ml_results["s7_trend_momentum"] = main_decider_signal
+#        main_decider_signal = self.s7_trend_momentum(df)
+#        ml_results["s7_trend_momentum"] = main_decider_signal
+        main_decider_signal = self.s7_fvg_breakout(df)
+        ml_results["s7_fvg_breakout"] = main_decider_signal
 
         # If main decider is enabled and gives a clear signal (BUY/SELL), it overrides all
         if self.main_decider_enabled and main_decider_signal != "HOLD":
@@ -255,7 +322,7 @@ class mlEngine:
             ml_results["s4_mfi"],        # BUY or SELL
             ml_results["s5_volume_break"], # BUY or SELL
             ml_results["s6_trend_slope"],  # BUY or SELL
-            ml_results["s7_trend_momentum"] # BUY, SELL, or HOLD
+            ml_results["s7_fvg_breakout"] # BUY, SELL, or HOLD
         ]
         
         # Count BUY and SELL votes (HOLD from s7 doesn't contribute to threshold)
