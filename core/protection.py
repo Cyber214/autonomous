@@ -8,7 +8,7 @@ import pandas as pd
 import numpy as np
 
 class ProtectionSystem:
-    def __init__(self, max_daily_loss=50.0, max_consecutive_losses=5, trading_hours=("07:00", "18:00"), max_volatility=3.0, volatility_window=50):
+    def __init__(self, max_daily_loss=50.0, max_consecutive_losses=5, trading_hours=("00:00", "23:59"), max_volatility=3.0, volatility_window=50):
         self.max_daily_loss = max_daily_loss
         self.max_consecutive_losses = max_consecutive_losses
         self.trading_hours = trading_hours
