@@ -4,14 +4,14 @@ import os
 
 load_dotenv()
 
+
 def load_config():
     return {
-        # Deriv API Configuration
-        "deriv": {
-            "app_id": os.getenv("DERIV_APP_ID"),
-            "token": os.getenv("DERIV_TOKEN"),
-            "symbol": os.getenv("DERIV_SYMBOL", "R_100"),
-            "demo": os.getenv("DERIV_DEMO", "true").lower() == "true"
+        # Bybit API Configuration
+        "bybit": {
+            "symbol": os.getenv("BYBIT_SYMBOL", "BTCUSDT"),
+            "interval": os.getenv("BYBIT_INTERVAL", "1"),
+            "demo": os.getenv("BYBIT_DEMO", "false").lower() == "true"
         },
         
         # Telegram Configuration

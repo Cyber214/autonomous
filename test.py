@@ -7,6 +7,8 @@ import os
 import logging
 import random
 
+from core import performance_tracker
+
 # FIXED: Setup logging FIRST - BOTH console and file
 logging.basicConfig(
     level=logging.INFO,
@@ -21,20 +23,23 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 # Add this line:
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'execution'))
 
-async def simulated_price_stream(start_price=70000, volatility=0.01, ticks=30):
-    """Generate simulated price stream with good movements"""
+async def simulated_price_stream(start_price=70000, volatility=0.02, ticks=50):
+    """Generate simulated price stream with good movements for more trades"""
     current_price = start_price
     trend = -1  # Bearish trend for SELL positions
-    
+
     for i in range(ticks):
-        # Bigger movements for testing
-        change = (random.random() * volatility * trend) + (random.random() * volatility * 0.3)
+        # More volatility for more price swings and trade opportunities
+        change = (random.random() * volatility * trend) + (random.random() * volatility * 0.5)
         current_price = current_price * (1 + change)
-        
-        high = current_price * (1 + random.random() * 0.002)
-        low = current_price * (1 - random.random() * 0.002)
+
+        # Ensure price doesn't go too low
+        current_price = max(current_price, 30000)
+
+        high = current_price * (1 + random.random() * 0.005)
+        low = current_price * (1 - random.random() * 0.005)
         volume = random.uniform(10, 100)
-        
+
         yield {
             'quote': current_price,
             'high': high,
@@ -43,8 +48,8 @@ async def simulated_price_stream(start_price=70000, volatility=0.01, ticks=30):
             'timestamp': 0,
             'is_candle': True
         }
-        
-        await asyncio.sleep(0.1)  # Faster for testing
+
+        await asyncio.sleep(0.05)  # Even faster for testing
 
 async def main():
     """Final clean test"""
@@ -62,9 +67,10 @@ async def main():
     from execution.order_manager import OrderManager
     from core.performance_tracker import PerformanceTracker
     
+
     # Config
     config = {
-        "deriv": {"symbol": "R_100"},
+        "bybit": {"symbol": "BTCUSDT"},
         "strategy": {"trade_amount": 100}
     }
     
@@ -73,9 +79,12 @@ async def main():
     ml_models_manager = MLModelsManager(models_dir="./models")
     strategy_engine = mlEngine(ml_models_manager=ml_models_manager)
     protection = ProtectionSystem()
+
     controller = TradingController(strategy_engine, protection, config)
     risk_manager = RiskManager(capital=1000.0)
-    order_manager = OrderManager(risk_manager)
+    order_manager = OrderManager(risk_manager=risk_manager, max_positions=1)
+    # Reduce cooldown to allow more trades
+    order_manager.cooldown_ticks = 1  # Allow trades every other tick
     performance = PerformanceTracker(initial_capital=1000.0)
     
     # Load initial data
@@ -88,9 +97,12 @@ async def main():
     logger.info("="*60)
     
     tick_count = 0
-    max_ticks = 30
+    max_ticks = 50
     
     async for tick in simulated_price_stream(start_price=70000, volatility=0.01, ticks=max_ticks):
+        
+        # 🔥 SET CURRENT TICK ON ORDER MANAGER
+        order_manager.current_tick = tick_count
         tick_count += 1
         
         price = tick['quote']
@@ -129,7 +141,12 @@ async def main():
                     if order:
                         logger.info(f"✅ Order: {order['side']} {order['quantity']}")
             except Exception as e:
+                import traceback
                 logger.warning(f"⚠️ Error: {e}")
+                logger.warning(f"Traceback: {traceback.format_exc()}")
+                print("FULL ERROR TRACEBACK:")
+                traceback.print_exc()
+                print("=" * 60)
         
         # Check positions
         await order_manager.check_positions({'R_100': price})
@@ -153,7 +170,7 @@ async def main():
     # Close any open positions
     last_price = price if 'price' in locals() else 70000
     for symbol, position in order_manager.positions.items():
-        if position['status'] == 'OPEN':
+        if 'status' in position and position['status'] == 'OPEN':
             await order_manager.close_position(symbol, last_price, 'END_OF_TEST')
     
     # Record trades
@@ -176,6 +193,28 @@ async def main():
     
     # Also print final message to console for visibility
     print(f"\n✅ Test complete! Log saved to test.log")
+
+    # Add this debug at end of test.py before showing results
+    print(f"DEBUG: Closed positions count: {len(order_manager.closed_positions)}")
+    # In your test.py, around line 195, replace the problematic section:
+
+    # Original code (probably):
+    # for pos in closed_positions:
+    #     performance_tracker.record_trade(pos['close'])
+
+    # Fixed code:
+    if hasattr(performance_tracker, 'record_trade'):
+        for pos in closed_positions:
+            performance_tracker.record_trade(pos['close'])
+    elif hasattr(performance_tracker, 'add_trade'):
+        for pos in closed_positions:
+            performance_tracker.add_trade(pos['close'])
+    else:
+        print(f"DEBUG: performance_tracker methods: {[m for m in dir(performance_tracker) if not m.startswith('_')]}")
+        print(f"DEBUG: Recording {len(closed_positions)} closed positions")
+        # Track them manually if needed
+        for pos in closed_positions:
+            print(f"DEBUG: Closed position: {pos}")
 
 if __name__ == "__main__":
     asyncio.run(main())

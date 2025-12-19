@@ -116,8 +116,9 @@ class TelegramBot:
             f"• Trading Hours: {status['within_trading_hours']}\n"
             f"• Main Decider: {status['main_decider_enabled']}\n"
             f"• Current Duration: {status['current_trade_duration']}\n"
+
             f"• Current Amount: ${self.controller.trade_amount}\n"
-            f"• Current Market: {self.controller.config['deriv']['symbol']}"
+            f"• Current Market: {self.controller.config['bybit']['symbol']}"
         )
         await update.message.reply_text(response)
 

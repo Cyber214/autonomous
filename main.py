@@ -10,7 +10,8 @@ async def main():
     # Use the same protection instance everywhere
     protection = controller.protection
     
-    # Start the runtime loop (NO deriv parameter)
+
+    # Start the runtime loop
     await run_loop(
         telegram,
         ml_models_manager,

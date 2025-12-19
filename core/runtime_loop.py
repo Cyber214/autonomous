@@ -6,17 +6,14 @@ import asyncio
 import time
 from datetime import datetime
 
+
 from utils.logger import get_logger
 
 logger = get_logger()
 
-
 async def run_loop(telegram, ml_models_manager, strategy_engine, protection, config):
     """
-    Main trading loop - UPDATED for Bybit data feed and signal-based architecture.
-    
-    REMOVED: deriv parameter (no more Deriv)
-    ADDED: Bybit data feed integration
+    Main trading loop - Bybit data feed and signal-based architecture.
     """
     logger.info("🚀 Starting PTX with Bybit data feed...")
     
@@ -38,9 +35,10 @@ async def run_loop(telegram, ml_models_manager, strategy_engine, protection, con
         await telegram.send(f"❌ SYSTEM ERROR: Cannot import execution service: {e}")
         return
     
+
     # Initialize Bybit data feed
     try:
-        symbol = config["deriv"]["symbol"]  # Still using config key, but will be Bybit
+        symbol = config["bybit"]["symbol"]
         interval = "5"  # 5-minute candles
         
         bybit_feed = BybitDataFeed(symbol=symbol, interval=interval)
@@ -71,9 +69,8 @@ async def run_loop(telegram, ml_models_manager, strategy_engine, protection, con
         await telegram.send(f"❌ SYSTEM ERROR: Execution service init failed: {e}")
         return
     
+
     # Initialize trading controller
-    # Note: We need to modify controller to not depend on deriv_client
-    # For now, pass None or create a mock
     from core.trading_controller import TradingController
     controller = TradingController(
         strategy_engine=strategy_engine,
@@ -312,16 +309,5 @@ async def run_loop(telegram, ml_models_manager, strategy_engine, protection, con
         except Exception:
             pass
         
+
         logger.info("✅ PTX Bybit shutdown complete")
-
-
-# Legacy compatibility wrapper (temporary)
-async def run_loop_legacy(deriv, controller, telegram, ml_models_manager, strategy_engine, protection, config):
-    """
-    Legacy wrapper for backward compatibility during migration.
-    """
-    logger.warning("⚠️ Using legacy run_loop wrapper (Deriv is deprecated)")
-    await telegram.send("⚠️ Using legacy Deriv wrapper - migrating to Bybit")
-    
-    # Call the new Bybit-based loop
-    return await run_loop(telegram, ml_models_manager, strategy_engine, protection, config)

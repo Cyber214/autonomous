@@ -11,6 +11,7 @@ from datetime import datetime
 import pandas as pd
 from utils.logger import get_logger
 from core.signal import TradingSignal
+from core.production_risk_manager import ProductionRiskManager, MarketRegime
 
 logger = get_logger()
 
@@ -30,10 +31,11 @@ class TradingController:
         self.trade_cooldown = 60
         self.telegram = None
         self.real_balance = None
+
         self.shutting_down = False
         self.active_protection_reason = None
         
-        self.symbol = config["deriv"]["symbol"]
+        self.symbol = config["bybit"]["symbol"]
         
         self._ensure_logs_directory()
         self.setup_graceful_shutdown()
@@ -184,7 +186,7 @@ class TradingController:
     async def analyze_and_signal(self, market_data: dict) -> TradingSignal:
         # FIX: Get price properly
         current_price = 0
-        
+
         # Try all possible price fields
         for field in ['quote', 'current', 'price', 'close', 'last', 'bid', 'ask']:
             price_val = market_data.get(field)
@@ -195,7 +197,7 @@ class TradingController:
                         break
                 except:
                     continue
-        
+
         # If still 0, try to get from tick structure
         if current_price <= 0:
             # Check if it's a tick with quote field
@@ -203,75 +205,63 @@ class TradingController:
                 current_price = market_data['quote']
             elif isinstance(market_data, dict) and 'current' in market_data:
                 current_price = market_data['current']
-        
+
         if current_price <= 0:
             logger.error(f"⚠️ Invalid price: {current_price} from market_data: {market_data}")
             return TradingSignal.hold_signal(
                 symbol=self.symbol,
                 reason="Invalid price data"
             )
-        logger.info(f"🔍 analyze_and_signal CALLED with price: ${market_data.get('quote', 0):.2f}")
-        
-        # Get current price
-        current_price = market_data.get('current', 0)
-        if current_price == 0:
-            current_price = market_data.get('quote', 0)
-        
-        # Get strategy decision
+
+        # Market data is now handled by ProductionRiskManager in execution service
+
+        logger.info(f"🔍 analyze_and_signal CALLED with price: ${current_price:.2f}")
+
+        # Get strategy decision with enhanced ML engine
         decision, strategy_results = self.strategy_engine.decide()
-        
+
         # If decision is HOLD, return HOLD signal
         if decision == "HOLD":
             return TradingSignal.hold_signal(
                 symbol=self.symbol,
                 reason="Strategy vote: HOLD"
             )
-        
-        # Calculate ML confidence
-        ml_votes = {k: v for k, v in strategy_results.items() 
-                    if k.startswith("s") and k[1:].isdigit()}
-        buy_votes = sum(1 for v in ml_votes.values() if v == "BUY")
-        sell_votes = sum(1 for v in ml_votes.values() if v == "SELL")
-        total_votes = len(ml_votes)
-        
-        if decision == "BUY":
-            confidence = buy_votes / total_votes if total_votes > 0 else 0.5
-        else:  # SELL
-            confidence = sell_votes / total_votes if total_votes > 0 else 0.5
-        
-        # Calculate trading levels
-        entry_zone, stop_ref, target_ref = self._calculate_trading_levels(
-            market_data, decision, current_price
-        )
-        
-        # Create signal
+
+        # Calculate basic confidence from vote strength
+        buy_votes = sum(1 for v in strategy_results.values() if v == "BUY")
+        sell_votes = sum(1 for v in strategy_results.values() if v == "SELL")
+        total_votes = len(strategy_results)
+        confidence = max(buy_votes, sell_votes) / total_votes if total_votes > 0 else 0.5
+
+        # Basic stop loss calculation (2% for simplicity)
+        stop_loss = current_price * 0.98 if decision == "BUY" else current_price * 1.02
+
+        # Basic position size (fixed for now)
+        position_size = self.trade_amount
+
+        # Create basic signal
         signal = TradingSignal(
             symbol=self.symbol,
             direction=decision,
             setup="ML_VOTE",
-            entry_zone=entry_zone,
-            stop_reference=stop_ref,
-            target_reference=target_ref,
+            entry_zone=(current_price * 0.999, current_price * 1.001),  # ±0.1% entry zone
+            stop_reference=stop_loss,
+            target_reference=current_price * 1.03 if decision == "BUY" else current_price * 0.97,  # 3% target
             confidence=confidence,
             reason={
                 "strategy": "ML_ENSEMBLE",
-                "ml_votes": {
-                    "buy": buy_votes,
-                    "sell": sell_votes,
-                    "total": total_votes
-                },
                 "individual_votes": strategy_results,
                 "current_price": current_price
             },
             metadata={
-                "volatility": self._calculate_volatility_from_data(market_data),
+                "position_size": position_size,
                 "cooldown_active": not self.can_trade()
             }
         )
-        
+
         # Log the signal
         logger.info(f"📡 Signal generated: {signal}")
-        
+
         return signal
     
     def _calculate_trading_levels(self, market_data: dict, direction: str, current_price: float):
@@ -339,6 +329,9 @@ class TradingController:
         winning_signals = len([t for t in self.trade_log if t.get('profit_loss', 0) > 0])
         total_profit = sum(trade.get('profit_loss', 0) for trade in self.trade_log)
 
+        # Get risk manager report
+        risk_report = self.risk_manager.get_risk_report()
+
         return {
             "paused": self.is_paused,
             "symbol": self.symbol,
@@ -353,7 +346,21 @@ class TradingController:
             "max_daily_loss": self.protection.max_daily_loss,
             "max_consecutive_losses": self.protection.max_consecutive_losses,
             "account_balance": self.real_balance,
-            "trade_cooldown_active": not self.can_trade()
+            "trade_cooldown_active": not self.can_trade(),
+            # Production risk management metrics
+            "risk_management": {
+                "current_drawdown": risk_report['risk_metrics']['current_drawdown'],
+                "max_drawdown": risk_report['risk_metrics']['max_drawdown'],
+                "daily_pnl": risk_report['risk_metrics']['daily_pnl'],
+                "weekly_pnl": risk_report['risk_metrics']['weekly_pnl'],
+                "sharpe_ratio": risk_report['risk_metrics']['sharpe_ratio'],
+                "win_rate": risk_report['risk_metrics']['win_rate'],
+                "volatility": risk_report['risk_metrics']['volatility'],
+                "market_regime": risk_report['risk_metrics']['market_regime'],
+                "circuit_breaker_level": risk_report['circuit_breakers']['level'],
+                "circuit_breaker_reason": risk_report['circuit_breakers']['reason'],
+                "current_leverage_limit": risk_report['position_limits']['max_leverage']
+            }
         }
 
     # --------------------------------------------------------
@@ -379,7 +386,8 @@ class TradingController:
             raise ValueError("Symbol cannot be empty")
         
         self.symbol = normalized
-        self.config["deriv"]["symbol"] = normalized
+
+        self.config["bybit"]["symbol"] = normalized
         
         self.strategy_engine.reset_history()
         

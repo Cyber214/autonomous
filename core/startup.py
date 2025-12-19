@@ -30,8 +30,9 @@ async def startup():
         logger.error(error_msg)
         raise ImportError(error_msg)
     
+
     # Initialize Bybit data feed
-    symbol = config["deriv"]["symbol"]
+    symbol = config["bybit"]["symbol"]
     interval = "1"
     
     try:
@@ -65,9 +66,10 @@ async def startup():
         trading_hours=tuple(config["protection"]["trading_hours"]),
         max_volatility=float(os.getenv("MAX_VOLATILITY", 3.0)),
         volatility_window=int(os.getenv("VOLATILITY_WINDOW", 50))
+
     )
     
-    # Initialize trading controller (NO deriv_client parameter)
+    # Initialize trading controller
     controller = TradingController(strategy_engine, protection, config)
     
     # Initialize Telegram bot
@@ -84,8 +86,10 @@ async def startup():
     logger.info("✅ PTX Bybit migration startup complete!")
     logger.info(f"   Symbol: {symbol}")
     logger.info(f"   Data: Bybit OHLCV candles")
+
     logger.info(f"   Mode: Paper Trading")
     logger.info(f"   Architecture: Signal → Execution Service")
     
-    # Return bybit_feed instead of deriv
+
+    # Return bybit_feed
     return bybit_feed, controller, telegram, ml_models_manager, strategy_engine, config
