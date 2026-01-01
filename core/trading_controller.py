@@ -8,10 +8,12 @@ import os
 import time
 import uuid
 from datetime import datetime
+from typing import Dict, List
 import pandas as pd
 from utils.logger import get_logger
 from core.signal import TradingSignal
 from core.production_risk_manager import ProductionRiskManager, MarketRegime
+from core.saved_strategies import strategy_fvg, range_scalp_4h, strategy_ma, analyze_all_strategies
 
 logger = get_logger()
 
@@ -31,6 +33,14 @@ class TradingController:
         self.trade_cooldown = 60
         self.telegram = None
         self.real_balance = None
+
+        # Multi-strategy system
+        self.enabled_strategies = {
+            "FVG": True,
+            "RANGE_4H": True,
+            "MA": True
+        }
+        self.price_history = []
 
         self.shutting_down = False
         self.active_protection_reason = None
@@ -57,6 +67,142 @@ class TradingController:
     def _ensure_logs_directory(self):
         if not os.path.exists('logs'):
             os.makedirs('logs')
+
+    # --------------------------------------------------------
+    # ================= MULTI-STRATEGY METHODS ================
+    # --------------------------------------------------------
+    def update(self, price, high, low, volume):
+        """Update price history for all strategies"""
+        candle = {
+            "open": price,
+            "high": high,
+            "low": low,
+            "close": price,
+            "volume": volume
+        }
+        self.price_history.append(candle)
+        
+        # Keep only last 500 candles
+        self.price_history = self.price_history[-500:]
+    
+    def _df(self):
+        """Convert price_history to DataFrame for strategies"""
+        if not self.price_history:
+            return pd.DataFrame()
+        return pd.DataFrame(self.price_history)
+    
+    async def analyze_and_signal(self, market_data: dict) -> TradingSignal:
+        """Run all enabled strategies and combine signals"""
+        # First, update price history if provided
+        if isinstance(market_data, dict):
+            current_price = market_data.get('quote') or market_data.get('current') or market_data.get('price', 0)
+            high = market_data.get('high', current_price)
+            low = market_data.get('low', current_price)
+            volume = market_data.get('volume', 0)
+            
+            if current_price > 0:
+                self.update(current_price, high, low, volume)
+        
+        # Convert to DataFrame
+        df = self._df()
+        
+        if df.empty or len(df) < 50:
+            return TradingSignal.hold_signal(
+                symbol=self.symbol,
+                reason="Insufficient data"
+            )
+        
+        signals = []
+        
+        # Run enabled strategies
+        if self.enabled_strategies.get("FVG", True):
+            result_fvg = strategy_fvg(df)
+            if result_fvg["direction"] != "HOLD":
+                signals.append(result_fvg)
+        
+        if self.enabled_strategies.get("RANGE_4H", True):
+            result_range = range_scalp_4h(df)
+            if result_range["direction"] != "HOLD":
+                signals.append(result_range)
+        
+        if self.enabled_strategies.get("MA", True):
+            result_ma = strategy_ma(df)
+            if result_ma["direction"] != "HOLD":
+                signals.append(result_ma)
+        
+        # Resolve signals using consensus
+        final_signal = self._resolve_signals(signals, df)
+        
+        return final_signal
+    
+    def _resolve_signals(self, signals: List[Dict], df: pd.DataFrame) -> TradingSignal:
+        """Resolve multiple strategy signals into one TradingSignal"""
+        if not signals:
+            return TradingSignal.hold_signal(
+                symbol=self.symbol,
+                reason="No strategy signals generated"
+            )
+        
+        # Get current price
+        current_price = df.iloc[-1]['close'] if len(df) > 0 else 0
+        
+        # Count votes
+        buy_votes = sum(1 for s in signals if s["direction"] == "BUY")
+        sell_votes = sum(1 for s in signals if s["direction"] == "SELL")
+        
+        # Calculate consensus and strength
+        total_votes = len(signals)
+        consensus = max(buy_votes, sell_votes) / total_votes
+        avg_strength = sum(s["signal_strength"] for s in signals) / total_votes
+        
+        # Determine direction
+        if buy_votes > sell_votes:
+            direction = "BUY"
+        elif sell_votes > buy_votes:
+            direction = "SELL"
+        else:
+            # Tie - check individual strengths
+            buy_strength = sum(s["signal_strength"] for s in signals if s["direction"] == "BUY")
+            sell_strength = sum(s["signal_strength"] for s in signals if s["direction"] == "SELL")
+            direction = "BUY" if buy_strength >= sell_strength else "SELL"
+        
+        # Calculate confidence (consensus × average strength)
+        confidence = consensus * avg_strength
+        
+        # Calculate stop loss and target (2% stop, 6% target for 3:1 R:R)
+        if direction == "BUY":
+            stop_loss = current_price * 0.98
+            target = current_price * 1.06
+        else:
+            stop_loss = current_price * 1.02
+            target = current_price * 0.94
+        
+        # Build reason string
+        strategy_names = [s.get("strategy", "UNKNOWN") for s in signals]
+        reason = {
+            "strategies": strategy_names,
+            "buy_votes": buy_votes,
+            "sell_votes": sell_votes,
+            "consensus": consensus,
+            "individual_signals": signals
+        }
+        
+        logger.info(f"📡 Multi-strategy signal: {direction} (confidence: {confidence:.2f}, strategies: {strategy_names})")
+        
+        return TradingSignal(
+            symbol=self.symbol,
+            direction=direction,
+            setup="MULTI_STRATEGY",
+            entry_zone=(current_price * 0.999, current_price * 1.001),
+            stop_reference=stop_loss,
+            target_reference=target,
+            confidence=confidence,
+            reason=reason,
+            metadata={
+                "consensus": consensus,
+                "strategy_count": total_votes
+            }
+        )
 
     # --------------------------------------------------------
     # ================== PROTECTION CHECK METHOD =============
@@ -180,139 +326,6 @@ class TradingController:
     def update_trade_time(self):
         self.last_trade_time = time.time()
 
-    # --------------------------------------------------------
-    # ================= SIGNAL GENERATION METHOD =============
-    # --------------------------------------------------------
-    async def analyze_and_signal(self, market_data: dict) -> TradingSignal:
-        # FIX: Get price properly
-        current_price = 0
-
-        # Try all possible price fields
-        for field in ['quote', 'current', 'price', 'close', 'last', 'bid', 'ask']:
-            price_val = market_data.get(field)
-            if price_val:
-                try:
-                    current_price = float(price_val)
-                    if current_price > 0:
-                        break
-                except:
-                    continue
-
-        # If still 0, try to get from tick structure
-        if current_price <= 0:
-            # Check if it's a tick with quote field
-            if isinstance(market_data, dict) and 'quote' in market_data:
-                current_price = market_data['quote']
-            elif isinstance(market_data, dict) and 'current' in market_data:
-                current_price = market_data['current']
-
-        if current_price <= 0:
-            logger.error(f"⚠️ Invalid price: {current_price} from market_data: {market_data}")
-            return TradingSignal.hold_signal(
-                symbol=self.symbol,
-                reason="Invalid price data"
-            )
-
-        # Market data is now handled by ProductionRiskManager in execution service
-
-        logger.info(f"🔍 analyze_and_signal CALLED with price: ${current_price:.2f}")
-
-        # Get strategy decision with enhanced ML engine
-        decision, strategy_results = self.strategy_engine.decide()
-
-        # If decision is HOLD, return HOLD signal
-        if decision == "HOLD":
-            return TradingSignal.hold_signal(
-                symbol=self.symbol,
-                reason="Strategy vote: HOLD"
-            )
-
-        # Calculate basic confidence from vote strength
-        buy_votes = sum(1 for v in strategy_results.values() if v == "BUY")
-        sell_votes = sum(1 for v in strategy_results.values() if v == "SELL")
-        total_votes = len(strategy_results)
-        confidence = max(buy_votes, sell_votes) / total_votes if total_votes > 0 else 0.5
-
-        # Basic stop loss calculation (2% for simplicity)
-        stop_loss = current_price * 0.98 if decision == "BUY" else current_price * 1.02
-
-        # Basic position size (fixed for now)
-        position_size = self.trade_amount
-
-        # Create basic signal
-        signal = TradingSignal(
-            symbol=self.symbol,
-            direction=decision,
-            setup="ML_VOTE",
-            entry_zone=(current_price * 0.999, current_price * 1.001),  # ±0.1% entry zone
-            stop_reference=stop_loss,
-            target_reference=current_price * 1.03 if decision == "BUY" else current_price * 0.97,  # 3% target
-            confidence=confidence,
-            reason={
-                "strategy": "ML_ENSEMBLE",
-                "individual_votes": strategy_results,
-                "current_price": current_price
-            },
-            metadata={
-                "position_size": position_size,
-                "cooldown_active": not self.can_trade()
-            }
-        )
-
-        # Log the signal
-        logger.info(f"📡 Signal generated: {signal}")
-
-        return signal
-    
-    def _calculate_trading_levels(self, market_data: dict, direction: str, current_price: float):
-        """Calculate entry zone, stop loss, and take profit levels for 3:1 R:R."""
-        # Get recent high/low from market data
-        recent_high = market_data.get('high', current_price * 1.001)
-        recent_low = market_data.get('low', current_price * 0.999)
-        
-        # For 3:1 R:R with 10x leverage, use tighter stops
-        stop_multiplier = 1.002 if direction == "SELL" else 0.998  # 0.2% stop
-        risk_reward_ratio = 3.0  # 3:1 R:R
-        
-        if direction == "BUY":
-            # For BUY: Entry near recent low, stop below, target above
-            entry_low = recent_low * 0.999
-            entry_high = recent_low * 1.001
-            stop_ref = recent_low * 0.998  # Tighter stop: 0.2% below
-            
-            # Calculate target for 3:1 risk:reward
-            entry_mid = (entry_low + entry_high) / 2
-            risk = abs(entry_mid - stop_ref)
-            target_ref = entry_mid + (risk * risk_reward_ratio)  # ✅ 3:1
-        
-        elif direction == "SELL":
-            # For SELL: Entry near recent high, stop above, target below
-            entry_low = recent_high * 0.999
-            entry_high = recent_high * 1.001
-            stop_ref = recent_high * 1.002  # Tighter stop: 0.2% above
-            
-            # Calculate target for 3:1 risk:reward
-            entry_mid = (entry_low + entry_high) / 2
-            risk = abs(stop_ref - entry_mid)
-            target_ref = entry_mid - (risk * risk_reward_ratio)  # ✅ 3:1
-        
-        else:  # HOLD
-            return None, None, None
-        
-        entry_zone = (entry_low, entry_high)
-        return entry_zone, stop_ref, target_ref
-    
-    def _calculate_volatility_from_data(self, market_data: dict) -> float:
-        """Calculate volatility from market data."""
-        high = market_data.get('high', 0)
-        low = market_data.get('low', 0)
-        
-        if high > 0 and low > 0:
-            range_pct = ((high - low) / low) * 100
-            return float(range_pct)
-        
-        return 0.0
-    
     # --------------------------------------------------------
     # ================== PAUSE / RESUME / STATUS =============
     # --------------------------------------------------------
@@ -443,3 +456,4 @@ class TradingController:
 
         self.trade_log.append(log_entry)
         return log_entry
+
