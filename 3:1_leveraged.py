@@ -1,28 +1,22 @@
 """
-3:1 Risk/Reward Strategy with Leverage
+3:1 Risk/Reward Strategy with Leverage - MARGIN-BASED RISK MODEL
 
-The math with leverage:
-- 10x leverage on 3:1 R:R = effectively 30% reward, 20% risk per trade
-- Win: +30% | Loss: -20%
-- 30% win rate: 0.30×30% - 0.70×20% = +9% - 14% = -5% ❌
+THE CORRECT MARGIN-BASED RISK MODEL:
+    risk = (capital × margin_pct) × risk_of_margin_pct
+    
+Example with $1000 account:
+    - Margin (20% of capital): $200
+    - Risk (50% of margin): $100
+    - Target (3× risk): $300
 
-Let's try 5x leverage:
-- 5x leverage on 3:1 R:R = 15% reward, 10% risk per trade
-- Win: +15% | Loss: -10%
-- 30% win rate: 0.30×15% - 0.70×10% = +4.5% - 7% = -2.5% ❌
+SCALING EXAMPLE:
+    - $1000 account → Margin $200 → Risk $100 → Target $300
+    - $1500 account → Margin $300 → Risk $150 → Target $450
+    - $2000 account → Margin $400 → Risk $200 → Target $600
 
-We need HIGHER win rate with leverage!
-
-At 35% win rate with 5x leverage:
-- 0.35×15% - 0.65×10% = +5.25% - 6.5% = -1.25% ❌
-
-At 40% win rate with 5x leverage:
-- 0.40×15% - 0.60×10% = +6% - 6% = 0% ✓
-
-At 45% win rate with 5x leverage:
-- 0.45×15% - 0.55×10% = +6.75% - 5.5% = +1.25% ✅
-
-So with 5x leverage, we need 40%+ win rate to be profitable!
+KEY DIFFERENCE FROM FIXED MODEL:
+    - Fixed: Risk = $100 (ALWAYS, regardless of account size)
+    - Margin-based: Risk = (account × 0.20) × 0.50 (SCALES with account!)
 """
 import pandas as pd
 import numpy as np
@@ -35,13 +29,13 @@ def generate_trending_data(num_candles=500, seed=42):
     
     for i in range(num_candles):
         if i < 125:
-            drift = 0.0006  # Uptrend
+            drift = 0.0006
         elif i < 250:
-            drift = -0.0006  # Downtrend
+            drift = -0.0006
         elif i < 375:
-            drift = 0.0007  # Strong uptrend
+            drift = 0.0007
         else:
-            drift = 0.0002  # Final uptrend
+            drift = 0.0002
         
         change = np.random.normal(drift, 0.012)
         prices.append(prices[-1] * (1 + change))
@@ -55,12 +49,13 @@ def generate_trending_data(num_candles=500, seed=42):
     })
     return df
 
-def backtest_with_leverage(df, leverage=5, risk_pct=0.02, stop_pct=0.02, target_pct=0.06):
+def backtest_with_margin_based_risk(df, leverage=5, margin_pct=0.20, risk_of_margin_pct=0.250, 
+                                     stop_pct=0.01, target_pct=0.03):
     """
-    Run backtest with leverage
+    Run backtest with MARGIN-BASED risk model.
     
-    leverage: e.g., 5x means 5x the returns (and risk)
-    risk_pct: % of capital to risk per trade (before leverage)
+    THE CORRECT MODEL:
+        risk = (capital × margin_pct) × risk_of_margin_pct
     """
     initial_capital = 1000.0
     capital = initial_capital
@@ -72,16 +67,41 @@ def backtest_with_leverage(df, leverage=5, risk_pct=0.02, stop_pct=0.02, target_
         result = analyze_all_strategies(df.iloc[:i+1])
         
         if result['direction'] != 'HOLD' and position is None:
-            # Position size = capital × risk% ÷ stop%
-            # With 2% risk and 2% stop, we use 100% of risk-adjusted capital
-            position_size_pct = risk_pct / stop_pct  # e.g., 2%/2% = 1.0 (full use)
-            
             entry_price = df.iloc[i]['close']
+            
+            # Calculate MARGIN-BASED risk amount (SCALES with capital!)
+            margin_amount = capital * margin_pct
+            risk_amount = margin_amount * risk_of_margin_pct
+            
+            # Reward is ALWAYS 3× risk
+            reward_amount = risk_amount * 3
+            
+            # Calculate stop loss price
+            if result['direction'] == 'BUY':
+                stop_loss_price = entry_price * (1 - stop_pct)
+            else:
+                stop_loss_price = entry_price * (1 + stop_pct)
+            
+            # Calculate target price (3× stop distance)
+            if result['direction'] == 'BUY':
+                target_price = entry_price * (1 + target_pct)
+            else:
+                target_price = entry_price * (1 - target_pct)
+            
+            # Position size = risk_amount / dollar distance to SL
+            dollar_risk_per_unit = abs(entry_price - stop_loss_price)
+            position_units = risk_amount / dollar_risk_per_unit
+            
             position = {
                 'type': result['direction'],
                 'entry_price': entry_price,
-                'size_pct': position_size_pct * leverage,  # Apply leverage
-                'risk_pct': risk_pct * leverage  # Effective risk with leverage
+                'stop_loss': stop_loss_price,
+                'target_price': target_price,
+                'units': position_units,
+                'risk_amount': risk_amount,
+                'reward_amount': reward_amount,
+                'leverage': leverage,
+                'capital_at_entry': capital
             }
             signals.append({
                 'idx': i,
@@ -91,113 +111,138 @@ def backtest_with_leverage(df, leverage=5, risk_pct=0.02, stop_pct=0.02, target_
         
         elif position is not None:
             current_price = df.iloc[i]['close']
-            entry_price = position['entry_price']
-            pct_change = (current_price - entry_price) / entry_price
-            
-            effective_change = pct_change * leverage
             
             if position['type'] == 'BUY':
-                if effective_change <= -position['risk_pct']:
-                    # Loss: -risk_pct × leverage
-                    capital += -position['risk_pct'] * capital * position['size_pct'] / leverage
-                    trades.append({'type': 'LONG', 'pnl_pct': -risk_pct * leverage, 'exit': 'STOP'})
+                if current_price <= position['stop_loss']:
+                    capital += -position['risk_amount']
+                    trades.append({
+                        'type': 'LONG', 
+                        'pnl': -position['risk_amount'], 
+                        'exit': 'STOP',
+                        'capital_before': position['capital_at_entry'],
+                        'pnl_pct': -position['risk_amount'] / position['capital_at_entry'] * 100
+                    })
                     position = None
-                elif effective_change >= target_pct * leverage:
-                    # Win: +target_pct × leverage
-                    capital += target_pct * leverage * capital * position['size_pct'] / leverage
-                    trades.append({'type': 'LONG', 'pnl_pct': target_pct * leverage, 'exit': 'PROFIT'})
+                elif current_price >= position['target_price']:
+                    capital += position['reward_amount']
+                    trades.append({
+                        'type': 'LONG', 
+                        'pnl': position['reward_amount'], 
+                        'exit': 'PROFIT',
+                        'capital_before': position['capital_at_entry'],
+                        'pnl_pct': position['reward_amount'] / position['capital_at_entry'] * 100
+                    })
                     position = None
-            else:  # SHORT
-                if effective_change >= position['risk_pct']:
-                    capital += -position['risk_pct'] * capital * position['size_pct'] / leverage
-                    trades.append({'type': 'SHORT', 'pnl_pct': -risk_pct * leverage, 'exit': 'STOP'})
+            else:
+                if current_price >= position['stop_loss']:
+                    capital += -position['risk_amount']
+                    trades.append({
+                        'type': 'SHORT', 
+                        'pnl': -position['risk_amount'], 
+                        'exit': 'STOP',
+                        'capital_before': position['capital_at_entry'],
+                        'pnl_pct': -position['risk_amount'] / position['capital_at_entry'] * 100
+                    })
                     position = None
-                elif effective_change <= -target_pct * leverage:
-                    capital += target_pct * leverage * capital * position['size_pct'] / leverage
-                    trades.append({'type': 'SHORT', 'pnl_pct': target_pct * leverage, 'exit': 'PROFIT'})
+                elif current_price <= position['target_price']:
+                    capital += position['reward_amount']
+                    trades.append({
+                        'type': 'SHORT', 
+                        'pnl': position['reward_amount'], 
+                        'exit': 'PROFIT',
+                        'capital_before': position['capital_at_entry'],
+                        'pnl_pct': position['reward_amount'] / position['capital_at_entry'] * 100
+                    })
                     position = None
     
     if position:
-        current_price = df.iloc[-1]['close']
-        entry_price = position['entry_price']
-        pct_change = (current_price - entry_price) / entry_price
-        effective_change = pct_change * leverage
-        
+        current_price = df['close'].iloc[-1]
         if position['type'] == 'BUY':
-            capital += effective_change * capital * position['size_pct'] / leverage
-            trades.append({'type': position['type'], 'pnl_pct': effective_change, 'exit': 'EOD'})
+            pct_change = (current_price - position['entry_price']) / position['entry_price']
+            pnl = pct_change * position['units'] * position['entry_price']
         else:
-            capital += -effective_change * capital * position['size_pct'] / leverage
-            trades.append({'type': position['type'], 'pnl_pct': -effective_change, 'exit': 'EOD'})
+            pct_change = (position['entry_price'] - current_price) / position['entry_price']
+            pnl = pct_change * position['units'] * position['entry_price']
+        capital += pnl
+        trades.append({
+            'type': position['type'], 
+            'pnl': pnl, 
+            'exit': 'EOD',
+            'capital_before': position['capital_at_entry'],
+            'pnl_pct': pct_change * 100
+        })
     
     return {
         'signals': signals,
         'trades': trades,
         'capital': capital,
-        'initial_capital': initial_capital
+        'initial_capital': initial_capital,
+        'margin_pct': margin_pct,
+        'risk_of_margin_pct': risk_of_margin_pct,
+        'leverage': leverage
     }
 
-def print_results(results, leverage, risk_pct, stop_pct, target_pct):
-    signals = results['signals']
+def print_results(results):
+    """Print backtest results"""
     trades = results['trades']
     capital = results['capital']
     initial = results['initial_capital']
+    margin_pct = results['margin_pct']
+    risk_of_margin_pct = results['risk_of_margin_pct']
+    leverage = results['leverage']
     
-    wins = [t for t in trades if t['pnl_pct'] > 0]
-    losses = [t for t in trades if t['pnl_pct'] < 0]
+    wins = [t for t in trades if t['pnl'] > 0]
+    losses = [t for t in trades if t['pnl'] < 0]
     win_rate = len(wins) / len(trades) * 100 if trades else 0
     total_pnl = capital - initial
     roi = total_pnl / initial * 100
     
-    rr_ratio = target_pct / stop_pct
-    effective_risk = risk_pct * leverage
-    effective_reward = target_pct * leverage
+    initial_margin = initial * margin_pct
+    initial_risk = initial_margin * risk_of_margin_pct
+    initial_reward = initial_risk * 3
     
-    print("\n" + "="*60)
-    print(f"LEVERAGED BACKTEST RESULTS ({leverage}x Leverage)")
-    print("="*60)
+    print("\n" + "="*70)
+    print(f"BACKTEST RESULTS ({leverage}x Leverage) - MARGIN-BASED MODEL")
+    print("="*70)
     print(f"Price: ${50000:.2f} -> ${results.get('final_price', 'N/A')}")
-    print(f"Signals: {len(signals)}, Trades: {len(trades)}")
+    print(f"Signals: {len(results['signals'])}, Trades: {len(trades)}")
     print(f"  Wins: {len(wins)} ({win_rate:.1f}%)")
     print(f"  Losses: {len(losses)}")
-    print("-"*60)
+    print("-"*70)
     print(f"Capital: ${initial:.2f} -> ${capital:.2f}")
     print(f"P&L: ${total_pnl:.2f}")
     print(f"ROI: {roi:.2f}%")
-    print("-"*60)
-    print(f"Leverage: {leverage}x")
-    print(f"Base Risk: {risk_pct*100}% | Effective Risk: {effective_risk*100}%")
-    print(f"Base Reward: {target_pct*100}% | Effective Reward: {effective_reward*100}%")
-    print(f"Effective R:R Ratio: {effective_reward/effective_risk:.1f}:1")
-    print("="*60)
-    
-    if len(trades) >= 10:
-        print(f"\n📊 Expected P&L per 100 trades:")
-        print(f"  Win Rate: {win_rate:.1f}%")
-        print(f"  Per Trade: {win_rate/100*effective_reward - (100-win_rate)/100*effective_risk:.2%}")
-        print(f"  Per $100 risked: ${100 * (win_rate/100*effective_reward - (100-win_rate)/100*effective_risk):.2f}")
+    print("-"*70)
+    print(f"MARGIN-BASED RISK MODEL:")
+    print(f"  Leverage: {leverage}x (affects MARGIN only)")
+    print(f"  Margin: {margin_pct:.0%} of capital = ${initial_margin:.2f}")
+    print(f"  Risk: {risk_of_margin_pct:.0%} of margin = ${initial_risk:.2f}")
+    print(f"  Reward: 3× risk = ${initial_reward:.2f}")
+    print(f"  R:R Ratio: 3:1")
+    print("-"*70)
+    print(f"Risk SCALES with account balance!")
+    print("="*70)
     
     return {
         'win_rate': win_rate,
         'total_pnl': total_pnl,
-        'num_trades': len(trades)
+        'num_trades': len(trades),
+        'wins': len(wins),
+        'losses': len(losses)
     }
 
 if __name__ == "__main__":
-    print("="*60)
-    print("3:1 R:R WITH LEVERAGE - EXPLAINED")
-    print("="*60)
-    print("\nWithout leverage (1x):")
-    print("  2% risk, 6% reward | Need 25% win rate to break even")
-    print("  30% win rate = +0.4% per trade = +$0.40 per $100")
-    print("\nWith 5x leverage:")
-    print("  10% effective risk, 30% effective reward")
-    print("  Need 40% win rate to break even!")
-    print("  45% win rate = +1.25% per trade = +$1.25 per $100")
-    print("\nWith 10x leverage:")
-    print("  20% effective risk, 60% effective reward")
-    print("  Need 40% win rate to break even!")
-    print("  45% win rate = +2.5% per trade = +$2.50 per $100")
+    print("="*70)
+    print("3:1 R:R WITH LEVERAGE - MARGIN-BASED RISK MODEL")
+    print("="*70)
+    print("\nTHE CORRECT MODEL:")
+    print("  risk = (capital × margin_pct) × risk_of_margin_pct")
+    print("  reward = risk × 3")
+    print("  leverage = affects MARGIN only, NOT P&L")
+    print("\nEXAMPLES:")
+    print("  $1000 account: Margin=$200, Risk=$50, Target=$150")
+    print("  $1500 account: Margin=$300, Risk=$75, Target=$225")
+    print("  $2000 account: Margin=$400, Risk=$100, Target=$300")
     
     df = generate_trending_data(500, seed=42)
     
@@ -205,26 +250,73 @@ if __name__ == "__main__":
     print(f"Price: ${df['close'].iloc[0]:.2f} -> ${df['close'].iloc[-1]:.2f}")
     print(f"Return: {(df['close'].iloc[-1]/df['close'].iloc[0]-1)*100:.2f}%")
     
-    print("\n" + "="*60)
-    print("TESTING DIFFERENT LEVERAGE LEVELS")
-    print("="*60)
+    margin_pct = 0.20
+    risk_of_margin_pct = 0.25
     
-    results_1x = backtest_with_leverage(df, leverage=1, risk_pct=0.02, stop_pct=0.02, target_pct=0.06)
+    print("\n" + "="*70)
+    print("TESTING DIFFERENT LEVERAGE LEVELS (MARGIN-BASED MODEL)")
+    print(f"Margin: {margin_pct:.0%}, Risk of Margin: {risk_of_margin_pct:.0%}")
+    print("All leverage levels should give IDENTICAL P&L!")
+    print("="*70)
+    
+    results_1x = backtest_with_margin_based_risk(df, leverage=1, margin_pct=margin_pct, risk_of_margin_pct=risk_of_margin_pct, stop_pct=0.01, target_pct=0.03)
     results_1x['final_price'] = df['close'].iloc[-1]
-    stats_1x = print_results(results_1x, 1, 0.02, 0.02, 0.06)
+    stats_1x = print_results(results_1x)
     
-    results_5x = backtest_with_leverage(df, leverage=5, risk_pct=0.02, stop_pct=0.02, target_pct=0.06)
+    results_5x = backtest_with_margin_based_risk(df, leverage=5, margin_pct=margin_pct, risk_of_margin_pct=risk_of_margin_pct, stop_pct=0.01, target_pct=0.03)
     results_5x['final_price'] = df['close'].iloc[-1]
-    stats_5x = print_results(results_5x, 5, 0.02, 0.02, 0.06)
+    stats_5x = print_results(results_5x)
     
-    results_10x = backtest_with_leverage(df, leverage=10, risk_pct=0.02, stop_pct=0.02, target_pct=0.06)
+    results_10x = backtest_with_margin_based_risk(df, leverage=10, margin_pct=margin_pct, risk_of_margin_pct=risk_of_margin_pct, stop_pct=0.01, target_pct=0.03)
     results_10x['final_price'] = df['close'].iloc[-1]
-    stats_10x = print_results(results_10x, 10, 0.02, 0.02, 0.06)
+    stats_10x = print_results(results_10x)
     
-    print("\n" + "="*60)
-    print("SUMMARY")
-    print("="*60)
-    print(f"1x Leverage: ${stats_1x['total_pnl']:.2f} | Win Rate: {stats_1x['win_rate']:.1f}%")
-    print(f"5x Leverage: ${stats_5x['total_pnl']:.2f} | Win Rate: {stats_5x['win_rate']:.1f}%")
+    results_25x = backtest_with_margin_based_risk(df, leverage=25, margin_pct=margin_pct, risk_of_margin_pct=risk_of_margin_pct, stop_pct=0.01, target_pct=0.03)
+    results_25x['final_price'] = df['close'].iloc[-1]
+    stats_25x = print_results(results_25x)
+    
+    print("\n" + "="*70)
+    print("SUMMARY - ALL LEVERAGES SHOULD GIVE SAME P&L")
+    print("="*70)
+    
+    all_same = (stats_1x['total_pnl'] == stats_5x['total_pnl'] == stats_10x['total_pnl'] == stats_25x['total_pnl'])
+    
+    print(f"1x  Leverage: ${stats_1x['total_pnl']:.2f} | Win Rate: {stats_1x['win_rate']:.1f}%")
+    print(f"5x  Leverage: ${stats_5x['total_pnl']:.2f} | Win Rate: {stats_5x['win_rate']:.1f}%")
     print(f"10x Leverage: ${stats_10x['total_pnl']:.2f} | Win Rate: {stats_10x['win_rate']:.1f}%")
-    print("="*60)
+    print(f"25x Leverage: ${stats_25x['total_pnl']:.2f} | Win Rate: {stats_25x['win_rate']:.1f}%")
+    print("="*70)
+    
+    if all_same:
+        print("\nSUCCESS: All leverage levels give EXACTLY the same P&L!")
+        print("Risk SCALES with account balance (MARGIN-BASED model).")
+    else:
+        print("\nFAILED: P&L differs by leverage!")
+    print("="*70)
+    
+    # Demonstrate scaling
+    print("\n\n" + "="*70)
+    print("DEMONSTRATING RISK SCALING WITH ACCOUNT SIZE")
+    print("="*70)
+    
+    test_capitals = [1000, 1500, 2000]
+    
+    for cap in test_capitals:
+        margin_amount = cap * margin_pct
+        risk_amount = margin_amount * risk_of_margin_pct
+        reward_amount = risk_amount * 3
+        num_wins = 3
+        num_losses = 7
+        simulated_pnl = num_wins * reward_amount - num_losses * risk_amount
+        
+        print(f"\n${cap} Account:")
+        print(f"  Margin ({margin_pct:.0%}): ${margin_amount:.2f}")
+        print(f"  Risk ({risk_of_margin_pct:.0%} of margin): ${risk_amount:.2f}")
+        print(f"  Target (3× risk): ${reward_amount:.2f}")
+        print(f"  10 trades (3 wins, 7 losses): ${simulated_pnl:.2f} P&L")
+        print(f"  ROI: {simulated_pnl/cap*100:.2f}%")
+    
+    print("\n" + "="*70)
+    print("P&L SCALES proportionally with account size!")
+    print("="*70)
+

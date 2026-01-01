@@ -12,7 +12,7 @@ from typing import Dict, List
 import pandas as pd
 from utils.logger import get_logger
 from core.signal import TradingSignal
-from core.production_risk_manager import ProductionRiskManager
+from core.production_risk_manager import ProductionRiskManager, MarketRegime
 from core.saved_strategies import strategy_fvg, range_scalp_4h, strategy_ma, analyze_all_strategies
 
 logger = get_logger()
@@ -22,17 +22,13 @@ class TradingController:
     def __init__(self, strategy_engine, protection, config):
         self.strategy_engine = strategy_engine
         self.protection = protection
-        paper_balance = config.get("paper_balance", 10000.0)
-        self.risk_manager = ProductionRiskManager(
-            initial_capital=paper_balance,
-            margin_pct=0.20,
-            risk_of_margin_pct=0.25,
-            min_confidence_threshold=0.6
-        )
-        self.trade_amount = self.risk_manager.risk_amount  # Dynamic risk based on margin
+        self.config = config
         self.is_paused = False
         self.trade_log = []
         self.trade_amount = config["strategy"]["trade_amount"]
+        self.trade_duration = 300
+        self.duration_source = "manual"
+        self.duration_last_updated = datetime.now()
         self.last_trade_time = 0
         self.trade_cooldown = 60
         self.telegram = None
@@ -252,19 +248,26 @@ class TradingController:
         # Default: Allow trading
         return True, None
 
+    # --------------------------------------------------------
+    # =========== TRADE AMOUNT / DURATION CONTROLS ===========
+    # --------------------------------------------------------
     def set_trade_amount(self, amount):
-        if hasattr(self, "risk_manager") and self.risk_manager and self.risk_manager.current_capital > 0:
-            margin = self.risk_manager.current_capital * self.risk_manager.margin_pct
-            if margin > 0:
-                new_risk_pct = float(amount) / margin
-                new_risk_pct = max(0.01, min(new_risk_pct, 1.0))
-                self.risk_manager.risk_of_margin_pct = new_risk_pct
-                self.risk_manager.risk_amount = float(amount)
-                self.trade_amount = float(amount)
-                print(f"Dynamic risk: ${self.trade_amount:.2f} ({new_risk_pct*100:.1f}% of margin)")
-        else:
-            self.trade_amount = float(amount)
-            print(f"Trade amount: ${self.trade_amount:.2f}")
+        self.trade_amount = float(amount)
+        print(f"💰 Trade amount set to: ${self.trade_amount}")
+
+    def set_trade_duration(self, duration, source="manual"):
+        self.trade_duration = int(duration)
+        self.duration_source = source
+        self.duration_last_updated = datetime.now()
+        minutes = duration / 60
+        print(f"⏱️ Trade duration set to: {minutes:.1f} minutes ({duration} seconds) via {source}")
+
+    # --------------------------------------------------------
+    # ================== VOLATILITY ANALYSIS =================
+    # --------------------------------------------------------
+    def analyze_market_volatility(self, df):
+        if len(df) < 100:
+            return 300
         volatility = df['price'].rolling(50).std().iloc[-1]
         if volatility > 2.0:
             return 180

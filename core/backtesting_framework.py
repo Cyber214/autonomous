@@ -100,14 +100,10 @@ class ProductionBacktester:
         # Initialize risk manager
         self.risk_manager = ProductionRiskManager(
             initial_capital=initial_capital,
-            max_daily_loss_pct=2.0,
-            max_weekly_loss_pct=5.0,
-            max_consecutive_losses=3,
+            margin_pct=0.20,
+            risk_of_margin_pct=0.25,
             min_confidence_threshold=0.6
         )
-
-        # Initialize ML engine
-        self.ml_engine = mlEngine()
 
         # Backtest results
         self.trades: List[TradeResult] = []
@@ -504,10 +500,9 @@ class ProductionBacktester:
 
         # Reset risk manager
         self.risk_manager = ProductionRiskManager(
-            initial_capital=self.initial_capital,
-            max_daily_loss_pct=2.0,
-            max_weekly_loss_pct=5.0,
-            max_consecutive_losses=3,
+            initial_capital=initial_capital,
+            margin_pct=0.20,           # ADD THIS: 20% margin
+            risk_of_margin_pct=0.25,   # ADD THIS: 25% of margin as risk
             min_confidence_threshold=0.6
         )
 
